@@ -1,0 +1,2 @@
+# nexusindex
+基于PostgreSQL Schema Json实现的类似ElasticSearch的搜索和数据分析引擎
