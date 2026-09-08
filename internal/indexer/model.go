@@ -73,6 +73,11 @@ type SearchResult struct {
 
 type SearchQuery struct {
 	Query      string
+	Sort       SearchSort
+	Must       []QueryClause
+	Should     []QueryClause
+	MustNot    []QueryClause
+	Filters    SearchFilters
 	EntityType string
 	CategoryID string
 	Status     string
@@ -89,6 +94,9 @@ type SearchPage struct {
 	NextCursor            string         `json:"next_cursor,omitempty"`
 	CandidateWindow       int            `json:"candidate_window"`
 	ExhaustedCandidateSet bool           `json:"exhausted_candidate_set"`
+	Sort                  SearchSort     `json:"sort"`
+	GenerationID          int64          `json:"generation_id"`
+	Facets                SearchFacets   `json:"facets,omitempty"`
 	Timing                SearchTiming   `json:"timing,omitempty"`
 }
 
@@ -125,4 +133,13 @@ type Status struct {
 	FailedJobCount    int64            `json:"failedJobCount"`
 	RunningJobCount   int64            `json:"runningJobCount"`
 	LastFailedMessage string           `json:"lastFailedMessage,omitempty"`
+}
+type FacetBucket struct {
+	Value string `json:"value"`
+	Count int64  `json:"count"`
+}
+type SearchFacets struct {
+	Entity   []FacetBucket `json:"entity"`
+	Category []FacetBucket `json:"category"`
+	Tag      []FacetBucket `json:"tag"`
 }

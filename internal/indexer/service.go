@@ -2,7 +2,6 @@ package indexer
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,10 +19,12 @@ import (
 )
 
 type Service struct {
-	mainDB   *pgxpool.Pool
-	indexDB  *pgxpool.Pool
-	runtime  *runtimeConfigStore
-	pipeline *QueryPipeline
+	mainDB      *pgxpool.Pool
+	indexDB     *pgxpool.Pool
+	generations *GenerationStore
+	runtime     *runtimeConfigStore
+	pipeline    *QueryPipeline
+	cursor      cursorCodec
 }
 
 type sourceRow struct {
@@ -59,11 +60,17 @@ func NewService(mainDB, indexDB *pgxpool.Pool) *Service {
 }
 
 func NewServiceWithRuntime(mainDB, indexDB *pgxpool.Pool, cfg RuntimeConfig) *Service {
+	return NewServiceWithRuntimeAndCursor(mainDB, indexDB, cfg, "")
+}
+
+func NewServiceWithRuntimeAndCursor(mainDB, indexDB *pgxpool.Pool, cfg RuntimeConfig, cursorSecret string) *Service {
 	return &Service{
-		mainDB:   mainDB,
-		indexDB:  indexDB,
-		runtime:  newRuntimeConfigStore(cfg),
-		pipeline: NewQueryPipeline(),
+		mainDB:      mainDB,
+		indexDB:     indexDB,
+		generations: NewGenerationStore(indexDB),
+		runtime:     newRuntimeConfigStore(cfg),
+		pipeline:    NewQueryPipeline(),
+		cursor:      newCursorCodec(cursorSecret),
 	}
 }
 
@@ -73,6 +80,10 @@ func (s *Service) RuntimeConfig() RuntimeConfig {
 
 func (s *Service) UpdateRuntimeConfig(ctx context.Context, cfg RuntimeConfig) RuntimeConfig {
 	return s.runtime.Update(ctx, cfg)
+}
+
+func (s *Service) RuntimeConfigVersion() uint64 {
+	return s.runtime.Version()
 }
 
 func (s *Service) Ping(ctx context.Context) error {
@@ -87,11 +98,15 @@ func (s *Service) Ping(ctx context.Context) error {
 
 func (s *Service) Status(ctx context.Context) (Status, error) {
 	status := Status{ByEntityType: map[string]int64{}}
-	if err := s.indexDB.QueryRow(ctx, `SELECT count(*) FROM search_index`).Scan(&status.Total); err != nil {
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return status, err
+	}
+	if err := s.indexDB.QueryRow(ctx, `SELECT count(*) FROM search_index WHERE generation_id = $1`, generation.ID).Scan(&status.Total); err != nil {
 		return status, err
 	}
 
-	rows, err := s.indexDB.Query(ctx, `SELECT entity_type, count(*) FROM search_index GROUP BY entity_type ORDER BY entity_type`)
+	rows, err := s.indexDB.Query(ctx, `SELECT entity_type, count(*) FROM search_index WHERE generation_id = $1 GROUP BY entity_type ORDER BY entity_type`, generation.ID)
 	if err != nil {
 		return status, err
 	}
@@ -125,87 +140,113 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 }
 
 func (s *Service) Search(ctx context.Context, req SearchQuery) (SearchPage, error) {
+	var err error
+	req, err = normalizeSearchQuery(req)
+	if err != nil {
+		return SearchPage{}, err
+	}
 	req.Query = strings.TrimSpace(req.Query)
 	req.EntityType = strings.TrimSpace(req.EntityType)
 	req.CategoryID = strings.TrimSpace(req.CategoryID)
 	req.Status = strings.TrimSpace(req.Status)
 	req.Limit = boundInt(req.Limit, 20, 1, 100)
-
-	cfg := s.RuntimeConfig()
-	structured := s.pipeline.Build(req.Query, cfg.Query)
-	cursor, err := decodeCursor(req.Cursor)
+	sortMode, err := normalizeSearchSort(req.Sort)
 	if err != nil {
 		return SearchPage{}, err
 	}
-	scoringNow := time.Now()
-	if cursor != nil && cursor.ScoredAt != "" {
-		if parsed, err := time.Parse(time.RFC3339Nano, cursor.ScoredAt); err == nil {
-			scoringNow = parsed
-		}
+	req.Sort = sortMode
+
+	cfg := s.RuntimeConfig()
+	structured := s.pipeline.Build(req.Query, cfg.Query)
+	cursor, err := s.cursor.decode(req.Cursor)
+	if err != nil {
+		return SearchPage{}, err
 	}
-	where := []string{"1=1"}
-	args := []any{}
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return SearchPage{}, err
+	}
+	queryHash := searchQueryHash(req)
+	configVersion := s.RuntimeConfigVersion()
+	scoringNow := time.Now()
+	if cursor != nil {
+		if cursor.Sort != req.Sort || cursor.GenerationID != generation.ID || cursor.ConfigVersion != configVersion || cursor.QueryHash != queryHash {
+			return SearchPage{}, errors.New("cursor does not match this search")
+		}
+		parsed, err := cursor.scoringTime()
+		if err != nil {
+			return SearchPage{}, errors.New("invalid cursor")
+		}
+		scoringNow = parsed
+	}
+
+	where := []string{"s.generation_id = $1"}
+	args := []any{generation.ID}
 	queryArg := 0
 
-	if req.EntityType != "" {
-		args = append(args, req.EntityType)
-		where = append(where, fmt.Sprintf("s.entity_type = $%d", len(args)))
-	}
-	if req.CategoryID != "" {
-		args = append(args, req.CategoryID)
-		where = append(where, fmt.Sprintf("s.category_id = $%d", len(args)))
-	}
-	if req.Status != "" {
-		args = append(args, req.Status)
-		where = append(where, fmt.Sprintf("s.status = $%d", len(args)))
-	} else {
-		where = append(where, "s.status NOT IN ('hidden', 'deleted')")
-	}
-	if len(req.Tags) > 0 {
-		args = append(args, normalizeStrings(req.Tags))
-		where = append(where, fmt.Sprintf("s.tags @> $%d::text[]", len(args)))
-	}
 	if structured.TSQueryText != "" {
 		args = append(args, structured.TSQueryText)
 		queryArg = len(args)
 		where = append(where, fmt.Sprintf("s.search_vector @@ plainto_tsquery('simple', $%d)", queryArg))
 	}
+	where, args = appendSearchFilters(where, args, req.Filters)
+	var clauseErr error
+	where, args, clauseErr = appendClauses(where, args, req.Must, req.Should, req.MustNot)
+	if clauseErr != nil {
+		return SearchPage{}, clauseErr
+	}
 
 	whereSQL := strings.Join(where, " AND ")
+	filterArgs := append([]any(nil), args...)
 	var total int64
 	countWhereSQL := strings.ReplaceAll(whereSQL, "s.", "")
-	if err := s.indexDB.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM search_index WHERE %s`, countWhereSQL), args...).Scan(&total); err != nil {
+	if err := s.indexDB.QueryRow(ctx, fmt.Sprintf(`SELECT count(*) FROM search_index WHERE %s`, countWhereSQL), filterArgs...).Scan(&total); err != nil {
 		return SearchPage{}, err
 	}
 
-	orderBy := "s.updated_at DESC NULLS LAST, s.indexed_at DESC, s.entity_type ASC, s.entity_id ASC"
-	rankSelect := "0::double precision AS pg_rank"
 	fromSQL := "search_index s"
 	if queryArg > 0 {
 		fromSQL = fmt.Sprintf("search_index s, (SELECT plainto_tsquery('simple', $%d) AS query) q", queryArg)
-		rankSelect = "ts_rank_cd(s.search_vector, q.query)::double precision AS pg_rank"
-		orderBy = "pg_rank DESC, s.updated_at DESC NULLS LAST, s.indexed_at DESC"
 	}
-	candidateLimit := cfg.CandidateLimit
-	args = append(args, candidateLimit)
+	scoringNowArg := ""
+	if req.Sort != SortLatest {
+		args = append(args, scoringNow.UTC())
+		scoringNowArg = fmt.Sprintf("$%d", len(args))
+	}
+	plan := buildSearchSQLPlan(req.Sort, queryArg > 0, cfg.Scoring, scoringNowArg, func(value any) string {
+		args = append(args, value)
+		return fmt.Sprintf("$%d", len(args))
+	})
+	keyset := keysetPredicate(req.Sort, cursor, &args)
+	if keyset != "" {
+		keyset = "WHERE " + keyset
+	}
+	args = append(args, req.Limit+1)
 
 	pgStarted := time.Now()
-	rows, err := s.indexDB.Query(ctx, fmt.Sprintf(`SELECT s.entity_type, s.entity_id, s.title, s.status, coalesce(s.category_id, ''), coalesce(s.author_id, ''),
-		s.tags, s.keywords, s.weight, s.view_count, s.like_count, s.download_count, s.payload, s.created_at, s.updated_at, s.indexed_at, %s
+	rows, err := s.indexDB.Query(ctx, fmt.Sprintf(`WITH ranked AS (
+		SELECT s.entity_type, s.entity_id, s.title, s.status, coalesce(s.category_id, '') AS category_id, coalesce(s.author_id, '') AS author_id,
+			s.tags, s.keywords, s.weight, s.view_count, s.like_count, s.download_count, s.payload, s.created_at, s.updated_at, s.indexed_at,
+			%s AS sort_score, coalesce(s.updated_at, s.created_at, s.indexed_at) AS sort_time
 		FROM %s WHERE %s
-		ORDER BY %s
-		LIMIT $%d`, rankSelect, fromSQL, whereSQL, orderBy, len(args)), args...)
+	)
+	SELECT entity_type, entity_id, title, status, category_id, author_id, tags, keywords, weight, view_count, like_count, download_count,
+		payload, created_at, updated_at, indexed_at, sort_score, sort_time
+	FROM ranked %s
+	ORDER BY %s
+	LIMIT $%d`, plan.scoreExpr, fromSQL, whereSQL, keyset, plan.orderBy, len(args)), args...)
 	if err != nil {
 		return SearchPage{}, err
 	}
 	defer rows.Close()
 
-	results := []SearchResult{}
+	results := make([]SearchResult, 0, req.Limit+1)
+	sortTimes := make([]time.Time, 0, req.Limit+1)
 	scoringStarted := time.Now()
 	for rows.Next() {
 		var item SearchResult
 		var payload []byte
-		var pgRank float64
+		var sortTime time.Time
 		if err := rows.Scan(
 			&item.EntityType,
 			&item.EntityID,
@@ -223,7 +264,8 @@ func (s *Service) Search(ctx context.Context, req SearchQuery) (SearchPage, erro
 			&item.CreatedAt,
 			&item.UpdatedAt,
 			&item.IndexedAt,
-			&pgRank,
+			&item.Score,
+			&sortTime,
 		); err != nil {
 			return SearchPage{}, err
 		}
@@ -231,8 +273,15 @@ func (s *Service) Search(ctx context.Context, req SearchQuery) (SearchPage, erro
 		item.Payload = map[string]any{}
 		_ = json.Unmarshal(payload, &item.Payload)
 		item.payloadText = flattenPayloadText(item.Payload)
-		item.Score, item.MatchedFields, item.Explanation = scoreResult(item, structured, cfg.Scoring, req.Explain, pgRank, scoringNow)
+		item.MatchedFields = matchedFields(item, structured)
+		if req.Explain {
+			item.Explanation = map[string]any{
+				"sort": req.Sort, "scoring_time": scoringNow.UTC().Format(time.RFC3339Nano),
+				"score_source": "postgresql", "weights": cfg.Scoring,
+			}
+		}
 		results = append(results, item)
+		sortTimes = append(sortTimes, sortTime)
 	}
 	if err := rows.Err(); err != nil {
 		return SearchPage{}, err
@@ -240,51 +289,50 @@ func (s *Service) Search(ctx context.Context, req SearchQuery) (SearchPage, erro
 	pgMS := scoringStarted.Sub(pgStarted).Milliseconds()
 	scoringMS := time.Since(scoringStarted).Milliseconds()
 
-	sort.SliceStable(results, func(i, j int) bool {
-		return compareResults(results[i], results[j])
-	})
-
-	pageItems := make([]SearchResult, 0, req.Limit)
-	for _, item := range results {
-		if cursor != nil && !isAfterCursor(item, *cursor) {
-			continue
-		}
-		if len(pageItems) == req.Limit {
-			break
-		}
-		pageItems = append(pageItems, item)
+	hasMore := len(results) > req.Limit
+	if hasMore {
+		results = results[:req.Limit]
+		sortTimes = sortTimes[:req.Limit]
 	}
 
 	nextCursor := ""
-	if len(pageItems) == req.Limit {
-		last := pageItems[len(pageItems)-1]
-		for i := range results {
-			if results[i].ID == last.ID && i+1 < len(results) {
-				nextCursor = encodeCursor(last, scoringNow)
-				break
-			}
+	if hasMore && len(results) > 0 {
+		last := results[len(results)-1]
+		nextCursor, err = s.cursor.encode(searchCursor{
+			Sort: req.Sort, Score: last.Score, SortTime: sortTimes[len(sortTimes)-1].UTC().Format(time.RFC3339Nano),
+			EntityType: last.EntityType, EntityID: last.EntityID, ScoredAt: scoringNow.UTC().Format(time.RFC3339Nano),
+			GenerationID: generation.ID, ConfigVersion: configVersion, QueryHash: queryHash,
+		})
+		if err != nil {
+			return SearchPage{}, err
 		}
 	}
 
 	highlightStarted := time.Now()
-	for i := range pageItems {
-		pageItems[i].Highlight = buildHighlight(pageItems[i], structured.Terms)
-		pageItems[i].payloadText = ""
+	for i := range results {
+		results[i].Highlight = buildHighlight(results[i], structured.Terms)
+		results[i].payloadText = ""
 	}
 	highlightMS := time.Since(highlightStarted).Milliseconds()
-	exhaustedCandidateSet := nextCursor == "" && total > int64(len(results))
+	facets, err := s.loadFacets(ctx, where, filterArgs)
+	if err != nil {
+		return SearchPage{}, err
+	}
 
 	indexLagMS := int64(0)
 	if req.Explain {
 		indexLagMS = s.IndexLagMS(ctx)
 	}
 	return SearchPage{
-		Items:                 pageItems,
+		Items:                 results,
 		Total:                 total,
 		Limit:                 req.Limit,
 		NextCursor:            nextCursor,
 		CandidateWindow:       len(results),
-		ExhaustedCandidateSet: exhaustedCandidateSet,
+		ExhaustedCandidateSet: false,
+		Sort:                  req.Sort,
+		GenerationID:          generation.ID,
+		Facets:                facets,
 		Timing: SearchTiming{
 			PGMS:          pgMS,
 			ScoringMS:     scoringMS,
@@ -311,11 +359,15 @@ func (s *Service) IndexLagMS(ctx context.Context) int64 {
 }
 
 func (s *Service) Tags(ctx context.Context, query, sortBy string, limit, offset int) ([]TagResult, int64, error) {
-	args := []any{}
-	where := "1=1"
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	args := []any{generation.ID}
+	where := "generation_id = $1"
 	if q := strings.TrimSpace(query); q != "" {
 		args = append(args, "%"+q+"%")
-		where = "tag ILIKE $1"
+		where += fmt.Sprintf(" AND tag ILIKE $%d", len(args))
 	}
 	var total int64
 	countSQL := fmt.Sprintf(`SELECT count(*) FROM tag_index WHERE %s`, where)
@@ -399,34 +451,17 @@ func (s *Service) StartEntityRebuild(ctx context.Context, entityType, entityID s
 
 func (s *Service) runFullRebuild(ctx context.Context, jobID int64) {
 	start := time.Now()
-	var total int
-	err := func() error {
-		tx, err := s.indexDB.Begin(ctx)
-		if err != nil {
-			return err
-		}
-		defer tx.Rollback(ctx)
-		if _, err := tx.Exec(ctx, `TRUNCATE search_index, tag_index`); err != nil {
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return err
-		}
-
-		for _, entityType := range EntityTypes {
-			count, err := s.rebuildEntityType(ctx, entityType)
-			if err != nil {
-				return err
-			}
-			total += count
-		}
-		return s.RebuildTags(ctx)
-	}()
-	if err != nil {
-		s.finishJob(ctx, jobID, "failed", "full rebuild failed", err, map[string]any{"durationMs": time.Since(start).Milliseconds(), "indexed": total})
+	var watermark int64
+	if err := s.mainDB.QueryRow(ctx, `SELECT coalesce(max(event_order), 0) FROM search_index_events`).Scan(&watermark); err != nil {
+		s.finishJob(ctx, jobID, "failed", "full rebuild failed", err, map[string]any{"durationMs": time.Since(start).Milliseconds()})
 		return
 	}
-	s.finishJob(ctx, jobID, "success", "full rebuild completed", nil, map[string]any{"durationMs": time.Since(start).Milliseconds(), "indexed": total})
+	result, err := NewRebuildCoordinator(&serviceRebuildBackend{service: s}).Run(ctx, jobID, watermark)
+	if err != nil {
+		s.finishJob(ctx, jobID, "failed", "full rebuild failed", err, map[string]any{"durationMs": time.Since(start).Milliseconds()})
+		return
+	}
+	s.finishJob(ctx, jobID, "success", "full rebuild completed", nil, map[string]any{"durationMs": time.Since(start).Milliseconds(), "indexed": result.Indexed, "generationId": result.GenerationID})
 }
 
 func (s *Service) runEntityRebuild(ctx context.Context, jobID int64, entityType, entityID string) {
@@ -456,10 +491,19 @@ func (s *Service) runEntityRebuild(ctx context.Context, jobID int64, entityType,
 }
 
 func (s *Service) rebuildEntityType(ctx context.Context, entityType string) (int, error) {
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return s.rebuildEntityTypeInto(ctx, entityType, generation.ID)
+}
+
+func (s *Service) rebuildEntityTypeInto(ctx context.Context, entityType string, generationID int64) (int, error) {
 	const batchSize = 500
 	total := 0
-	for offset := 0; ; offset += batchSize {
-		docs, err := s.fetchMany(ctx, entityType, batchSize, offset)
+	afterID := ""
+	for {
+		docs, err := s.fetchMany(ctx, entityType, afterID, batchSize)
 		if err != nil {
 			return total, err
 		}
@@ -470,11 +514,12 @@ func (s *Service) rebuildEntityType(ctx context.Context, entityType string) (int
 			return total, err
 		}
 		for _, doc := range docs {
-			if err := s.UpsertVersioned(ctx, doc, doc.SourceVersion); err != nil {
+			if err := s.upsertIntoGeneration(ctx, generationID, doc, doc.SourceVersion, true); err != nil {
 				return total, err
 			}
 			total++
 		}
+		afterID = docs[len(docs)-1].EntityID
 	}
 }
 
@@ -497,6 +542,14 @@ func sourceVersionConflict(versioned bool) (string, string) {
 }
 
 func (s *Service) upsert(ctx context.Context, doc SearchDocument, sourceVersion int64, versioned bool) error {
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return err
+	}
+	return s.upsertIntoGeneration(ctx, generation.ID, doc, sourceVersion, versioned)
+}
+
+func (s *Service) upsertIntoGeneration(ctx context.Context, generationID int64, doc SearchDocument, sourceVersion int64, versioned bool) error {
 	payload, err := json.Marshal(doc.Payload)
 	if err != nil {
 		return err
@@ -523,16 +576,16 @@ func (s *Service) upsert(ctx context.Context, doc SearchDocument, sourceVersion 
 	payloadIndexText := ftsText(flattenPayloadText(doc.Payload))
 	versionUpdate, versionGuard := sourceVersionConflict(versioned)
 	query := fmt.Sprintf(`INSERT INTO search_index (
-		entity_type, entity_id, title, status, category_id, author_id, tags, keywords, weight,
+		generation_id, entity_type, entity_id, title, status, category_id, author_id, tags, keywords, weight,
 		view_count, like_count, download_count, payload, created_at, updated_at, source_version, indexed_at, search_vector
 	) VALUES (
-		$1, $2, $3, $4, nullif($5, ''), nullif($6, ''), $7, $8, $9, $10, $11, $12, $13::jsonb, $14, $15, $16, now(),
-		setweight(to_tsvector('simple', $17), 'A') ||
-		setweight(to_tsvector('simple', $18), 'B') ||
-		setweight(to_tsvector('simple', $19), 'C') ||
-		setweight(to_tsvector('simple', $20), 'D')
+		$1, $2, $3, $4, $5, nullif($6, ''), nullif($7, ''), $8, $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, now(),
+		setweight(to_tsvector('simple', $18), 'A') ||
+		setweight(to_tsvector('simple', $19), 'B') ||
+		setweight(to_tsvector('simple', $20), 'C') ||
+		setweight(to_tsvector('simple', $21), 'D')
 	)
-	ON CONFLICT (entity_type, entity_id) DO UPDATE SET
+	ON CONFLICT (generation_id, entity_type, entity_id) DO UPDATE SET
 		title = EXCLUDED.title,
 		status = EXCLUDED.status,
 		category_id = EXCLUDED.category_id,
@@ -550,6 +603,7 @@ func (s *Service) upsert(ctx context.Context, doc SearchDocument, sourceVersion 
 		indexed_at = now(),
 		search_vector = EXCLUDED.search_vector%s`, versionUpdate, versionGuard)
 	_, err = s.indexDB.Exec(ctx, query,
+		generationID,
 		doc.EntityType,
 		doc.EntityID,
 		doc.Title,
@@ -575,19 +629,28 @@ func (s *Service) upsert(ctx context.Context, doc SearchDocument, sourceVersion 
 }
 
 func (s *Service) RebuildTags(ctx context.Context) error {
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return err
+	}
+	return s.rebuildTagsForGeneration(ctx, generation.ID)
+}
+
+func (s *Service) rebuildTagsForGeneration(ctx context.Context, generationID int64) error {
 	tx, err := s.indexDB.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `TRUNCATE tag_index`); err != nil {
+	if _, err := tx.Exec(ctx, `DELETE FROM tag_index WHERE generation_id = $1`, generationID); err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `WITH raw AS (
 		SELECT lower(trim(tag)) AS tag, entity_type, category_id
 		FROM search_index
 		CROSS JOIN LATERAL unnest(tags) AS tag
-		WHERE status NOT IN ('hidden', 'deleted')
+		WHERE generation_id = $1
+			AND status NOT IN ('hidden', 'deleted')
 			AND entity_type NOT IN ('tag', 'official_tag')
 			AND trim(tag) <> ''
 			AND trim(tag) !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
@@ -621,17 +684,17 @@ func (s *Service) RebuildTags(ctx context.Context) error {
 		GROUP BY tag
 	)
 	INSERT INTO tag_index (
-		tag, entity_types, total_count, resource_count, post_count, server_count, video_count,
+		generation_id, tag, entity_types, total_count, resource_count, post_count, server_count, video_count,
 		document_count, user_count, organization_count, tag_count, official_tag_count,
 		category_counts, payload, updated_at
 	)
-	SELECT tag, entity_types, total_count, resource_count, post_count, server_count, video_count,
+	SELECT $1, tag, entity_types, total_count, resource_count, post_count, server_count, video_count,
 		document_count, user_count, organization_count, tag_count, official_tag_count,
 		coalesce(category_totals.category_counts, '{}'::jsonb),
 		jsonb_build_object('source', 'search_index'),
 		now()
 	FROM tag_stats
-	LEFT JOIN category_totals USING (tag)`)
+	LEFT JOIN category_totals USING (tag)`, generationID)
 	if err != nil {
 		return err
 	}
@@ -639,17 +702,25 @@ func (s *Service) RebuildTags(ctx context.Context) error {
 }
 
 func (s *Service) markDeleted(ctx context.Context, entityType, entityID string, sourceVersion int64, versioned bool) error {
+	generation, err := s.generations.Active(ctx)
+	if err != nil {
+		return err
+	}
+	return s.markDeletedInGeneration(ctx, generation.ID, entityType, entityID, sourceVersion, versioned)
+}
+
+func (s *Service) markDeletedInGeneration(ctx context.Context, generationID int64, entityType, entityID string, sourceVersion int64, versioned bool) error {
 	versionUpdate, versionGuard := sourceVersionConflict(versioned)
 	query := fmt.Sprintf(`INSERT INTO search_index (
-		entity_type, entity_id, title, status, tags, keywords, payload, source_version, indexed_at, search_vector
-	) VALUES ($1, $2, '', 'deleted', '{}', '{}', '{"reason":"source entity not found"}'::jsonb, $3, now(), ''::tsvector)
-	ON CONFLICT (entity_type, entity_id) DO UPDATE SET
+		generation_id, entity_type, entity_id, title, status, tags, keywords, payload, source_version, indexed_at, search_vector
+	) VALUES ($1, $2, $3, '', 'deleted', '{}', '{}', '{"reason":"source entity not found"}'::jsonb, $4, now(), ''::tsvector)
+	ON CONFLICT (generation_id, entity_type, entity_id) DO UPDATE SET
 		status = 'deleted',
 		payload = search_index.payload || '{"reason":"source entity not found"}'::jsonb,
 		%s,
 		search_vector = ''::tsvector,
 		indexed_at = now()%s`, versionUpdate, versionGuard)
-	_, err := s.indexDB.Exec(ctx, query, entityType, entityID, sourceVersion)
+	_, err := s.indexDB.Exec(ctx, query, generationID, entityType, entityID, sourceVersion)
 	return err
 }
 
@@ -740,12 +811,12 @@ func (s *Service) finishJob(ctx context.Context, id int64, status, message strin
 		finished_at = now(), details = $5::jsonb WHERE id = $1`, id, status, message, errText, string(detailsJSON))
 }
 
-func (s *Service) fetchMany(ctx context.Context, entityType string, limit, offset int) ([]SearchDocument, error) {
+func (s *Service) fetchMany(ctx context.Context, entityType, afterID string, limit int) ([]SearchDocument, error) {
 	sql, err := selectSQL(entityType, false)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.mainDB.Query(ctx, sql, limit, offset)
+	rows, err := s.mainDB.Query(ctx, sql, afterID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -945,8 +1016,8 @@ func validEntityType(entityType string) bool {
 }
 
 func selectSQL(entityType string, single bool) (string, error) {
-	where := ""
-	limit := "LIMIT $1 OFFSET $2"
+	where := `WHERE src.id > $1`
+	limit := `LIMIT $2`
 	if single {
 		where = `WHERE src.id = $1`
 		limit = ""
@@ -976,7 +1047,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			FROM "Resource" src
 			LEFT JOIN "User" usr ON usr.id = src."authorId"
 			LEFT JOIN LATERAL (SELECT id, name, slug, icon, color FROM "Category" c WHERE c.id = src.category OR c.slug = src.category LIMIT 1) cat ON true
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityPost:
 		return fmt.Sprintf(`SELECT 'post', src.id, src.title,
 			CASE WHEN src."publishedAt" IS NOT NULL AND src."accessMode" = 'none' THEN src.status ELSE 'hidden' END,
@@ -994,7 +1065,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			FROM "Post" src
 			LEFT JOIN "User" usr ON usr.id = src."authorId"
 			LEFT JOIN "Board" board ON board.id = src."boardId"
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityServer:
 		return fmt.Sprintf(`SELECT 'server', src.id, src.title, src.status, src.visibility, coalesce(src.category, ''),
 			src."authorId", coalesce(src.tags, '[]'), coalesce(src.versions, '[]'), coalesce(src."networkEnvironments", '[]'),
@@ -1012,7 +1083,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			FROM "PlayerServer" src
 			LEFT JOIN "User" usr ON usr.id = src."authorId"
 			LEFT JOIN LATERAL (SELECT id, name, slug, icon, color FROM "PlayerServerCategory" c WHERE c.id = src.category OR c.slug = src.category LIMIT 1) cat ON true
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityVideo:
 		return fmt.Sprintf(`SELECT 'video', src.id, src.title, src.status, src.visibility, src."categoryId",
 			src."authorId", coalesce(src.tags, '[]'), '[]', '[]',
@@ -1028,7 +1099,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			FROM "Video" src
 			LEFT JOIN "User" usr ON usr.id = src."authorId"
 			LEFT JOIN "VideoCategory" cat ON cat.id = src."categoryId"
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityDocument:
 		return fmt.Sprintf(`SELECT 'document', src.id, src.title,
 			CASE WHEN src.published THEN 'published' ELSE 'draft' END,
@@ -1042,7 +1113,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 				'icon', src.icon, 'published', src.published, 'sortOrder', src."sortOrder"
 			)
 			FROM "CustomPage" src
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityUser:
 		return fmt.Sprintf(`SELECT 'user', src.id, src.username, src.status, 'public', coalesce(src.role, ''),
 			src.id, '[]', jsonb_build_array('user', coalesce(src.role, 'user'))::text,
@@ -1055,7 +1126,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 				'role', src.role, 'status', src.status, 'createdAt', src."createdAt"
 			)
 			FROM "User" src
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityOrganization:
 		return fmt.Sprintf(`SELECT 'organization', src.id, src.name, src.status, src.visibility, coalesce(src.category, ''),
 			src."ownerId", '[]', jsonb_build_array('organization', coalesce(nullif(src.category, ''), 'general'))::text,
@@ -1071,7 +1142,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			)
 			FROM "Organization" src
 			LEFT JOIN "User" owner ON owner.id = src."ownerId"
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityTag:
 		return fmt.Sprintf(`SELECT 'tag', src.id, src.name, 'active', 'public', 'tag',
 			'', jsonb_build_array(src.name)::text, '[]', jsonb_build_array(src.name, src.slug)::text,
@@ -1079,7 +1150,7 @@ func selectSQL(entityType string, single bool) (string, error) {
 			src."createdAt", src."createdAt",
 			jsonb_build_object('name', src.name, 'slug', src.slug, 'count', src.count)
 			FROM "Tag" src
-			%s ORDER BY src."createdAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	case EntityOfficialTag:
 		return fmt.Sprintf(`SELECT 'official_tag', src.id, src.name,
 			CASE WHEN src.enabled AND grp.enabled THEN 'active' ELSE 'hidden' END,
@@ -1095,17 +1166,10 @@ func selectSQL(entityType string, single bool) (string, error) {
 			)
 			FROM "OfficialTag" src
 			LEFT JOIN "OfficialTagGroup" grp ON grp.id = src."groupId"
-			%s ORDER BY src."updatedAt" DESC %s`, where, limit), nil
+			%s ORDER BY src.id ASC %s`, where, limit), nil
 	default:
 		return "", fmt.Errorf("unsupported entityType: %s", entityType)
 	}
-}
-
-type searchCursor struct {
-	Score     float64 `json:"score"`
-	UpdatedAt string  `json:"updatedAt"`
-	ID        string  `json:"id"`
-	ScoredAt  string  `json:"scoredAt,omitempty"`
 }
 
 func boundInt(value, fallback, min, max int) int {
@@ -1458,51 +1522,4 @@ func highlightEscapedTerm(value, term string) string {
 		lowerValue = lowerValue[idx+len(term):]
 	}
 	return out.String()
-}
-
-func compareResults(a, b SearchResult) bool {
-	if a.Score != b.Score {
-		return a.Score > b.Score
-	}
-	if !a.UpdatedAt.Equal(b.UpdatedAt) {
-		return a.UpdatedAt.After(b.UpdatedAt)
-	}
-	return a.ID < b.ID
-}
-
-func encodeCursor(item SearchResult, scoringNow time.Time) string {
-	payload, _ := json.Marshal(searchCursor{
-		Score:     item.Score,
-		UpdatedAt: item.UpdatedAt.UTC().Format(time.RFC3339Nano),
-		ID:        item.ID,
-		ScoredAt:  scoringNow.UTC().Format(time.RFC3339Nano),
-	})
-	return base64.RawURLEncoding.EncodeToString(payload)
-}
-
-func decodeCursor(value string) (*searchCursor, error) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return nil, nil
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil {
-		return nil, fmt.Errorf("invalid cursor")
-	}
-	var cursor searchCursor
-	if err := json.Unmarshal(raw, &cursor); err != nil {
-		return nil, fmt.Errorf("invalid cursor")
-	}
-	return &cursor, nil
-}
-
-func isAfterCursor(item SearchResult, cursor searchCursor) bool {
-	cursorTime, _ := time.Parse(time.RFC3339Nano, cursor.UpdatedAt)
-	if item.Score != cursor.Score {
-		return item.Score < cursor.Score
-	}
-	if !item.UpdatedAt.Equal(cursorTime) {
-		return item.UpdatedAt.Before(cursorTime)
-	}
-	return item.ID > cursor.ID
 }

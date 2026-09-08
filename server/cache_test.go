@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"testing"
 	"time"
+
+	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/indexer"
 )
 
 type fakeCache struct {
@@ -53,5 +55,15 @@ func TestCacheKeyVersionBump(t *testing.T) {
 	after := server.cacheKey("query", values)
 	if before == after {
 		t.Fatal("expected cache key to change after version bump")
+	}
+}
+
+func TestSearchCacheValuesIncludeStructuredQuery(t *testing.T) {
+	base := searchRequest{Q: "fabric", Sort: "relevance", Limit: 20}
+	structured := base
+	structured.Must = []indexer.QueryClause{{Field: "title", Operator: "phrase", Value: "fabric api"}}
+	structured.Filters = indexer.SearchFilters{Platforms: []string{"java"}}
+	if base.cacheValues().Encode() == structured.cacheValues().Encode() {
+		t.Fatal("structured query must change the search cache key")
 	}
 }

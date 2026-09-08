@@ -31,6 +31,11 @@ export interface NexusIndexEnv {
 
 export interface SearchParams {
   q?: string;
+  sort?: 'relevance' | 'latest' | 'popular';
+  must?: QueryClause[];
+  should?: QueryClause[];
+  must_not?: QueryClause[];
+  filters?: SearchFilters;
   entityType?: NexusIndexEntityType;
   categoryId?: string;
   status?: string;
@@ -39,6 +44,12 @@ export interface SearchParams {
   cursor?: string;
   explain?: boolean;
 }
+
+export interface QueryClause { field: string; operator?: 'match' | 'phrase' | 'prefix' | 'fuzzy'; value: string }
+export interface SearchFilters { entityTypes?: string[]; categoryIds?: string[]; statuses?: string[]; tagsAny?: string[]; tagsAll?: string[]; platforms?: string[]; viewCount?: NumericRange; likeCount?: NumericRange; downloadCount?: NumericRange; createdAt?: TimeRange; updatedAt?: TimeRange; minecraftVersion?: VersionRange }
+export interface NumericRange { gte?: number; gt?: number; lte?: number; lt?: number }
+export interface TimeRange { gte?: string; gt?: string; lte?: string; lt?: string }
+export interface VersionRange { gte?: string; gt?: string; lte?: string; lt?: string }
 
 export interface SearchItem {
   id: string;
@@ -72,12 +83,16 @@ export interface SearchResult {
   next_cursor?: string;
   candidate_window?: number;
   exhausted_candidate_set?: boolean;
+  sort?: 'relevance' | 'latest' | 'popular';
+  generation_id?: number;
+  facets?: { entity: FacetBucket[]; category: FacetBucket[]; tag: FacetBucket[] };
   timing?: {
     pg_ms: number;
     scoring_ms: number;
     highlight_ms: number;
   };
 }
+export interface FacetBucket { value: string; count: number }
 
 export interface TagParams {
   q?: string;
@@ -218,6 +233,11 @@ export function createNexusIndexClientFromEnv(env: NexusIndexEnv = process.env):
 function normalizeSearchParams(params: SearchParams): SearchParams {
   return {
     q: params.q?.trim() || '',
+    sort: params.sort || (params.q?.trim() ? 'relevance' : 'latest'),
+    must: params.must,
+    should: params.should,
+    must_not: params.must_not,
+    filters: params.filters,
     entityType: params.entityType,
     categoryId: params.categoryId?.trim() || '',
     status: params.status?.trim() || '',

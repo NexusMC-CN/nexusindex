@@ -2,19 +2,54 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/config"
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/db"
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/indexer"
+	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/migrations"
 	edgecache "github.com/blockbridge/avmcbbs/apps/nexusindex/packages/edgecache-go-client"
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/server"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+const (
+	modeServe   = "serve"
+	modeMigrate = "migrate"
+)
+
+type invocation struct {
+	mode   string
+	action string
+}
+
+func parseInvocation(args []string) (invocation, error) {
+	if len(args) == 0 {
+		return invocation{mode: modeServe}, nil
+	}
+	if len(args) == 2 && args[0] == modeMigrate && (args[1] == "status" || args[1] == "up") {
+		return invocation{mode: modeMigrate, action: args[1]}, nil
+	}
+	return invocation{}, fmt.Errorf("usage: nexusindex [migrate status|up]")
+}
+
 func main() {
+	inv, err := parseInvocation(os.Args[1:])
+	if err != nil {
+		log.Fatal(err)
+	}
+	if inv.mode == modeMigrate {
+		if err := runMigration(context.Background(), inv.action); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -27,7 +62,7 @@ func main() {
 	}
 	defer pools.Close()
 
-	if err := indexer.EnsureSchema(ctx, pools.Index); err != nil {
+	if err := migrations.ValidateSchemaVersion(ctx, pools.Index); err != nil {
 		log.Fatal(err)
 	}
 	if err := indexer.ValidateMainOutboxSchema(ctx, pools.Main); err != nil {
@@ -38,7 +73,11 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	indexService := indexer.NewServiceWithRuntime(pools.Main, pools.Index, runtimeConfig)
+	cursorSecret := cfg.CursorSecret
+	if cursorSecret == "" {
+		cursorSecret = cfg.APIToken
+	}
+	indexService := indexer.NewServiceWithRuntimeAndCursor(pools.Main, pools.Index, runtimeConfig, cursorSecret)
 	var cacheClient *edgecache.Client
 	if cfg.EdgeCacheEnabled {
 		cacheClient = edgecache.New(edgecache.Options{
@@ -90,6 +129,31 @@ func main() {
 	if err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
+}
+
+func runMigration(ctx context.Context, action string) error {
+	url, err := config.MigrationDatabaseURL()
+	if err != nil {
+		return err
+	}
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		return fmt.Errorf("open migration database: %w", err)
+	}
+	defer pool.Close()
+	if err := pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping migration database: %w", err)
+	}
+	if action == "up" {
+		if err := migrations.Up(ctx, pool); err != nil {
+			return err
+		}
+	}
+	status, err := migrations.Status(ctx, pool)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(os.Stdout).Encode(status)
 }
 
 func runtimeConfigFromAppConfig(cfg config.Config) (indexer.RuntimeConfig, error) {

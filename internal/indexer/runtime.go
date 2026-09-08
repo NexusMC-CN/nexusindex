@@ -295,12 +295,14 @@ func defaultSynonyms() map[string][]string {
 }
 
 type runtimeConfigStore struct {
-	value atomic.Value
+	value   atomic.Value
+	version atomic.Uint64
 }
 
 func newRuntimeConfigStore(cfg RuntimeConfig) *runtimeConfigStore {
 	store := &runtimeConfigStore{}
 	store.value.Store(cfg.Normalized())
+	store.version.Store(1)
 	return store
 }
 
@@ -318,5 +320,13 @@ func (s *runtimeConfigStore) Get() RuntimeConfig {
 func (s *runtimeConfigStore) Update(_ context.Context, cfg RuntimeConfig) RuntimeConfig {
 	cfg = cfg.Normalized().DeepCopy()
 	s.value.Store(cfg)
+	s.version.Add(1)
 	return cfg.DeepCopy()
+}
+
+func (s *runtimeConfigStore) Version() uint64 {
+	if s == nil {
+		return 1
+	}
+	return s.version.Load()
 }

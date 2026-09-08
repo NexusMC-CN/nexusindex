@@ -81,6 +81,12 @@ func (w *Worker) loop(ctx context.Context) {
 }
 
 func (w *Worker) ProcessOnce(ctx context.Context) error {
+	return withGenerationSwitchLock(ctx, w.service.mainDB, func() error {
+		return w.processOnceLocked(ctx)
+	})
+}
+
+func (w *Worker) processOnceLocked(ctx context.Context) error {
 	events, err := w.claimEvents(ctx)
 	if err != nil {
 		return err

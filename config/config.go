@@ -14,6 +14,7 @@ type Config struct {
 	IndexDatabaseURL              string
 	Port                          int
 	APIToken                      string
+	CursorSecret                  string
 	RequestTimeoutMS              int
 	EdgeCacheEnabled              bool
 	EdgeCacheURL                  string
@@ -58,6 +59,7 @@ func Load() (Config, error) {
 		IndexDatabaseURL:              strings.TrimSpace(os.Getenv("INDEX_DATABASE_URL")),
 		Port:                          envInt("NEXUSINDEX_PORT", 4412, 1, 65535),
 		APIToken:                      strings.TrimSpace(os.Getenv("NEXUSINDEX_API_TOKEN")),
+		CursorSecret:                  strings.TrimSpace(os.Getenv("NEXUSINDEX_CURSOR_SECRET")),
 		RequestTimeoutMS:              envInt("NEXUSINDEX_REQUEST_TIMEOUT_MS", 5000, 100, 120000),
 		EdgeCacheEnabled:              envBool("NEXUSINDEX_EDGECACHE_ENABLED", false),
 		EdgeCacheURL:                  strings.TrimSpace(envOr("NEXUSINDEX_EDGECACHE_URL", "http://127.0.0.1:4410")),
@@ -100,12 +102,24 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+func MigrationDatabaseURL() (string, error) {
+	_ = loadDotEnv(".env")
+	value := strings.TrimSpace(os.Getenv("INDEX_DATABASE_MIGRATION_URL"))
+	if value == "" {
+		return "", errors.New("INDEX_DATABASE_MIGRATION_URL is required for migration commands")
+	}
+	return value, nil
+}
+
 func (c Config) Validate() error {
 	if c.MainDatabaseReadonlyURL == "" {
 		return errors.New("MAIN_DATABASE_READONLY_URL is required")
 	}
 	if c.IndexDatabaseURL == "" {
 		return errors.New("INDEX_DATABASE_URL is required")
+	}
+	if c.CursorSecret == "" && c.APIToken == "" {
+		return errors.New("NEXUSINDEX_CURSOR_SECRET or NEXUSINDEX_API_TOKEN is required")
 	}
 	if c.Port < 1 || c.Port > 65535 {
 		return errors.New("NEXUSINDEX_PORT must be a valid TCP port")

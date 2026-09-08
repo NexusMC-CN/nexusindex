@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -43,15 +44,20 @@ type CacheOptions struct {
 }
 
 type searchRequest struct {
-	Q          string   `json:"q"`
-	EntityType string   `json:"entityType"`
-	CategoryID string   `json:"categoryId"`
-	Status     string   `json:"status"`
-	Tags       []string `json:"tags"`
-	Limit      int      `json:"limit"`
-	Offset     int      `json:"offset"`
-	Cursor     string   `json:"cursor"`
-	Explain    bool     `json:"explain"`
+	Q          string                `json:"q"`
+	Sort       string                `json:"sort"`
+	Must       []indexer.QueryClause `json:"must"`
+	Should     []indexer.QueryClause `json:"should"`
+	MustNot    []indexer.QueryClause `json:"must_not"`
+	Filters    indexer.SearchFilters `json:"filters"`
+	EntityType string                `json:"entityType"`
+	CategoryID string                `json:"categoryId"`
+	Status     string                `json:"status"`
+	Tags       []string              `json:"tags"`
+	Limit      int                   `json:"limit"`
+	Offset     int                   `json:"offset"`
+	Cursor     string                `json:"cursor"`
+	Explain    bool                  `json:"explain"`
 }
 
 type prewarmRequest struct {
@@ -228,6 +234,11 @@ func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	payload, err := s.searchPayload(r.Context(), req)
 	if err != nil {
+		var queryErr *indexer.QueryError
+		if errors.As(err, &queryErr) {
+			writeError(w, http.StatusBadRequest, queryErr.Code, queryErr.Message)
+			return
+		}
 		if strings.Contains(err.Error(), "invalid cursor") {
 			writeError(w, http.StatusBadRequest, "invalid_cursor", "invalid cursor")
 			return
@@ -280,6 +291,11 @@ func (s *HTTPServer) handleTags(w http.ResponseWriter, r *http.Request) {
 func (s *HTTPServer) searchPayload(ctx context.Context, req searchRequest) (map[string]any, error) {
 	page, err := s.indexer.Search(ctx, indexer.SearchQuery{
 		Query:      req.Q,
+		Sort:       indexer.SearchSort(req.Sort),
+		Must:       req.Must,
+		Should:     req.Should,
+		MustNot:    req.MustNot,
+		Filters:    req.Filters,
 		EntityType: req.EntityType,
 		CategoryID: req.CategoryID,
 		Status:     req.Status,
@@ -297,6 +313,9 @@ func (s *HTTPServer) searchPayload(ctx context.Context, req searchRequest) (map[
 		"limit":                   page.Limit,
 		"offset":                  0,
 		"next_cursor":             page.NextCursor,
+		"sort":                    page.Sort,
+		"generation_id":           page.GenerationID,
+		"facets":                  page.Facets,
 		"candidate_window":        page.CandidateWindow,
 		"exhausted_candidate_set": page.ExhaustedCandidateSet,
 	}
@@ -473,12 +492,14 @@ func (s *HTTPServer) handleEntityRebuild(w http.ResponseWriter, r *http.Request)
 func parseSearchRequest(r *http.Request) (searchRequest, error) {
 	req := searchRequest{Limit: 20, Offset: 0}
 	if r.Method == http.MethodPost {
+		r.Body = http.MaxBytesReader(nil, r.Body, 64<<10)
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			return req, fmt.Errorf("invalid json")
 		}
 	} else {
 		q := r.URL.Query()
 		req.Q = q.Get("q")
+		req.Sort = q.Get("sort")
 		req.EntityType = q.Get("entityType")
 		req.CategoryID = q.Get("categoryId")
 		req.Status = q.Get("status")
@@ -513,6 +534,14 @@ func (r searchRequest) normalized() searchRequest {
 	r.EntityType = strings.TrimSpace(r.EntityType)
 	r.CategoryID = strings.TrimSpace(r.CategoryID)
 	r.Status = strings.TrimSpace(r.Status)
+	r.Sort = strings.ToLower(strings.TrimSpace(r.Sort))
+	if r.Sort == "" {
+		if r.Q == "" {
+			r.Sort = string(indexer.SortLatest)
+		} else {
+			r.Sort = string(indexer.SortRelevance)
+		}
+	}
 	r.Cursor = strings.TrimSpace(r.Cursor)
 	r.Tags = cleanList(r.Tags)
 	r.Limit = boundValue(r.Limit, 20, 1, 100)
@@ -541,6 +570,7 @@ func (r tagsRequest) normalized() tagsRequest {
 func (r searchRequest) cacheValues() url.Values {
 	values := url.Values{}
 	values.Set("q", r.Q)
+	values.Set("sort", r.Sort)
 	values.Set("entityType", r.EntityType)
 	values.Set("categoryId", r.CategoryID)
 	values.Set("status", r.Status)
@@ -549,10 +579,21 @@ func (r searchRequest) cacheValues() url.Values {
 	}
 	values.Set("limit", strconv.Itoa(r.Limit))
 	values.Set("cursor", r.Cursor)
+	setJSONCacheValue(values, "must", r.Must)
+	setJSONCacheValue(values, "should", r.Should)
+	setJSONCacheValue(values, "must_not", r.MustNot)
+	setJSONCacheValue(values, "filters", r.Filters)
 	if r.Explain {
 		values.Set("explain", "true")
 	}
 	return values
+}
+
+func setJSONCacheValue(values url.Values, key string, value any) {
+	raw, err := json.Marshal(value)
+	if err == nil {
+		values.Set(key, string(raw))
+	}
 }
 
 func (r searchRequest) highlightCacheValues(id string) url.Values {

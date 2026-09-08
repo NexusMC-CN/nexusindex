@@ -35,8 +35,15 @@ func TestQueryPipelineEmptyAndSymbolsOnly(t *testing.T) {
 
 func TestCursorCarriesScoredAt(t *testing.T) {
 	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
-	cursor := encodeCursor(SearchResult{ID: "resource:1", Score: 1.25, UpdatedAt: now}, now)
-	decoded, err := decodeCursor(cursor)
+	codec := newCursorCodec("test-secret")
+	cursor, err := codec.encode(searchCursor{
+		Sort: SortRelevance, Score: 1.25, SortTime: now.Format(time.RFC3339Nano),
+		ScoredAt: now.Format(time.RFC3339Nano), GenerationID: 1, ConfigVersion: 1, QueryHash: "query",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := codec.decode(cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
