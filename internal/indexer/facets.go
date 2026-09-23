@@ -4,14 +4,23 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"github.com/jackc/pgx/v5"
 )
 
 const facetLimit = 20
 
-func (s *Service) loadFacets(ctx context.Context, where []string, args []any) (SearchFacets, error) {
+// Querier is shared by pools and transactions. Search passes its transaction
+// so dependent reads cannot silently acquire a different snapshot/connection.
+type Querier interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func loadFacets(ctx context.Context, db Querier, where []string, args []any) (SearchFacets, error) {
 	base := strings.ReplaceAll(strings.Join(where, " AND "), "s.", "")
 	query := func(sql string) ([]FacetBucket, error) {
-		rows, err := s.indexDB.Query(ctx, fmt.Sprintf(sql, base), args...)
+		rows, err := db.Query(ctx, fmt.Sprintf(sql, base), args...)
 		if err != nil {
 			return nil, err
 		}

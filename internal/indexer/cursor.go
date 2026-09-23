@@ -40,8 +40,12 @@ type searchCursor struct {
 	ScoredAt      string     `json:"scoredAt"`
 	GenerationID  int64      `json:"generationId"`
 	ConfigVersion uint64     `json:"configVersion"`
+	ConfigHash    string     `json:"configHash"`
 	QueryHash     string     `json:"queryHash"`
 }
+
+var ErrInvalidCursor = errors.New("invalid cursor")
+var ErrCursorMismatch = errors.New("cursor does not match this search")
 
 type cursorCodec struct {
 	secret []byte
@@ -73,24 +77,24 @@ func (c cursorCodec) decode(value string) (*searchCursor, error) {
 	}
 	parts := strings.Split(value, ".")
 	if len(parts) != 2 {
-		return nil, errors.New("invalid cursor")
+		return nil, ErrInvalidCursor
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return nil, errors.New("invalid cursor")
+		return nil, ErrInvalidCursor
 	}
 	signature, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, errors.New("invalid cursor")
+		return nil, ErrInvalidCursor
 	}
 	mac := hmac.New(sha256.New, c.secret)
 	_, _ = mac.Write(payload)
 	if !hmac.Equal(signature, mac.Sum(nil)) {
-		return nil, errors.New("invalid cursor")
+		return nil, ErrInvalidCursor
 	}
 	var cursor searchCursor
 	if err := json.Unmarshal(payload, &cursor); err != nil || cursor.ScoredAt == "" || cursor.QueryHash == "" {
-		return nil, errors.New("invalid cursor")
+		return nil, ErrInvalidCursor
 	}
 	return &cursor, nil
 }

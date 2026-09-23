@@ -3,9 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,19 +17,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/indexer"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type workerOptions struct {
-	DatabaseURL    string
-	Events         int
-	DistinctDocs   int
-	BatchSize      int
-	DuplicateRatio float64
-	WatchSeconds   int
-	PollMS         int
-	Seed           int64
-	RequireDrained bool
+	DatabaseURL      string
+	IndexDatabaseURL string
+	Events           int
+	DistinctDocs     int
+	BatchSize        int
+	DuplicateRatio   float64
+	WatchSeconds     int
+	PollMS           int
+	Seed             int64
+	RequireDrained   bool
 }
 
 type queryOptions struct {
@@ -68,6 +69,18 @@ type eventStats struct {
 	Failed    int64  `json:"failed"`
 	Backlog   int64  `json:"backlog"`
 	Locked    int64  `json:"locked"`
+}
+
+type workerEvent struct {
+	EntityType string
+	EntityID   string
+	Action     string
+	Payload    string
+}
+
+type workerExpectation struct {
+	Reference     indexer.SourceEntityReference
+	SourceVersion int64
 }
 
 type querySummary struct {
@@ -115,12 +128,15 @@ type querySample struct {
 }
 
 type stabilityCheck struct {
-	Class         string   `json:"class"`
-	Query         string   `json:"query"`
-	Stable        bool     `json:"stable"`
-	ExpectedTop10 []string `json:"expected_top10"`
-	MismatchAt    int      `json:"mismatch_at,omitempty"`
-	ActualTop10   []string `json:"actual_top10,omitempty"`
+	Class             string   `json:"class"`
+	Query             string   `json:"query"`
+	Stable            bool     `json:"stable"`
+	ExpectedTop10     []string `json:"expected_top10"`
+	MismatchAt        int      `json:"mismatch_at,omitempty"`
+	ActualTop10       []string `json:"actual_top10,omitempty"`
+	Error             string   `json:"error,omitempty"`
+	ExpectedStatus    int      `json:"expected_status,omitempty"`
+	ExpectedErrorCode string   `json:"expected_error_code,omitempty"`
 }
 
 type cursorCheck struct {
@@ -132,6 +148,7 @@ type cursorCheck struct {
 	Overlap     []string `json:"overlap,omitempty"`
 	MismatchAt  int      `json:"mismatch_at,omitempty"`
 	ActualPage2 []string `json:"actual_page2,omitempty"`
+	Error       string   `json:"error,omitempty"`
 }
 
 type searchResponse struct {
@@ -155,16 +172,20 @@ type searchResponse struct {
 	} `json:"debug"`
 }
 
-var entityTypes = []string{"resource", "post", "video", "user", "tag", "server"}
-var eventActions = []string{"upsert", "upsert", "upsert", "delete"}
+type queryCase struct {
+	Query string
+	// Zero expects a successful 2xx response with an items array.
+	ExpectedStatus    int
+	ExpectedErrorCode string
+}
 
-var queryClasses = map[string][]string{
-	"exact_title":   {"fabric 1.20.1", "optifine 光影", "sodium fabric", "paper 1.21"},
-	"tag":           {"mod", "plugin", "resourcepack", "shader"},
-	"chinese":       {"模组", "插件", "资源包", "光影"},
-	"version":       {"1.20.1", "1.21", "1.19.4", "1.18.2"},
-	"loader_domain": {"fabric mod", "paper plugin", "forge mod", "quilt mod"},
-	"garbage":       {"aaaa", "???", "hello", "zzzz unknown"},
+var queryClasses = map[string][]queryCase{
+	"exact_title":   {{Query: "fabric 1.20.1"}, {Query: "optifine 光影"}, {Query: "sodium fabric"}, {Query: "paper 1.21"}},
+	"tag":           {{Query: "mod"}, {Query: "plugin"}, {Query: "resourcepack"}, {Query: "shader"}},
+	"chinese":       {{Query: "模组"}, {Query: "插件"}, {Query: "资源包"}, {Query: "光影"}},
+	"version":       {{Query: "1.20.1"}, {Query: "1.21"}, {Query: "1.19.4"}, {Query: "1.18.2"}},
+	"loader_domain": {{Query: "fabric mod"}, {Query: "paper plugin"}, {Query: "forge mod"}, {Query: "quilt mod"}},
+	"garbage":       {{Query: "aaaa"}, {Query: "???", ExpectedStatus: http.StatusBadRequest, ExpectedErrorCode: "invalid_query_text"}, {Query: "hello"}, {Query: "zzzz unknown"}},
 }
 
 func main() {
@@ -194,6 +215,7 @@ func parseWorkerOptions(args []string) workerOptions {
 	fs := flag.NewFlagSet("worker", flag.ExitOnError)
 	opt := workerOptions{}
 	fs.StringVar(&opt.DatabaseURL, "database-url", env("MAIN_DATABASE_READONLY_URL", ""), "forum PostgreSQL URL containing search_index_events")
+	fs.StringVar(&opt.IndexDatabaseURL, "index-database-url", env("INDEX_DATABASE_URL", ""), "NexusIndex PostgreSQL URL used to verify indexed documents")
 	fs.IntVar(&opt.Events, "events", 10000, "events to insert: 10000, 50000, 100000")
 	fs.IntVar(&opt.DistinctDocs, "distinct-docs", 5000, "number of distinct documents to spread events across")
 	fs.IntVar(&opt.BatchSize, "batch-size", 1000, "insert batch size")
@@ -226,30 +248,51 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 	if opt.DatabaseURL == "" {
 		return fmt.Errorf("--database-url or MAIN_DATABASE_READONLY_URL is required")
 	}
+	if opt.IndexDatabaseURL == "" {
+		return fmt.Errorf("--index-database-url or INDEX_DATABASE_URL is required")
+	}
+	if opt.Events < 1 {
+		return errors.New("--events must be positive")
+	}
+	if opt.DistinctDocs < 1 {
+		return errors.New("--distinct-docs must be positive")
+	}
+	if opt.DistinctDocs > indexer.MaxSourceEntityReferences {
+		return fmt.Errorf("--distinct-docs must not exceed %d", indexer.MaxSourceEntityReferences)
+	}
+	if opt.BatchSize < 1 {
+		return errors.New("--batch-size must be positive")
+	}
 	rng := rand.New(rand.NewSource(opt.Seed))
-	pool, err := pgxpool.New(ctx, opt.DatabaseURL)
+	mainPool, err := pgxpool.New(ctx, opt.DatabaseURL)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
+	defer mainPool.Close()
+	indexPool, err := pgxpool.New(ctx, opt.IndexDatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer indexPool.Close()
 
 	started := time.Now()
+	runSource := fmt.Sprintf("stability-generator:%d:%d", opt.Seed, started.UnixNano())
 	summary := eventSummary{
 		Mode:         "worker",
 		StartedAt:    started.Format(time.RFC3339Nano),
 		ActionCounts: map[string]int{},
 		EntityCounts: map[string]int{},
 	}
-	before, err := readEventStats(ctx, pool)
+	before, err := readEventStats(ctx, mainPool)
 	if err != nil {
 		return err
 	}
 	summary.Before = before
 
-	docs := make([]string, 0, opt.DistinctDocs)
-	for i := 0; i < opt.DistinctDocs; i++ {
-		entityType := entityTypes[i%len(entityTypes)]
-		docs = append(docs, entityType+":"+stableID(entityType, i))
+	service := indexer.NewService(mainPool, nil)
+	refs, err := loadWorkerSourceReferences(ctx, service, opt.DistinctDocs)
+	if err != nil {
+		return err
 	}
 
 	inserted := 0
@@ -258,26 +301,17 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 		if remaining := opt.Events - inserted; remaining < n {
 			n = remaining
 		}
-		rows := make([][]any, 0, n)
-		for i := 0; i < n; i++ {
-			docIndex := inserted + i
-			if len(docs) > 0 && rng.Float64() < opt.DuplicateRatio {
-				docIndex = rng.Intn(len(docs))
-			}
-			doc := docs[docIndex%len(docs)]
-			parts := strings.SplitN(doc, ":", 2)
-			action := eventActions[rng.Intn(len(eventActions))]
-			payload := map[string]any{
-				"mock": true,
-				"seq":  inserted + i,
-				"seed": opt.Seed,
-			}
-			payloadJSON, _ := json.Marshal(payload)
-			rows = append(rows, []any{parts[0], parts[1], action, "stability-generator", string(payloadJSON)})
-			summary.ActionCounts[action]++
-			summary.EntityCounts[parts[0]]++
+		events, err := buildWorkerEvents(rng, refs, inserted, n, opt.DuplicateRatio, opt.Seed)
+		if err != nil {
+			return err
 		}
-		copied, err := pool.CopyFrom(ctx, []string{"search_index_events"}, []string{"entity_type", "entity_id", "action", "source", "payload"}, newCopyRows(rows))
+		rows := make([][]any, 0, len(events))
+		for _, event := range events {
+			rows = append(rows, []any{event.EntityType, event.EntityID, event.Action, runSource, event.Payload})
+			summary.ActionCounts[event.Action]++
+			summary.EntityCounts[event.EntityType]++
+		}
+		copied, err := mainPool.CopyFrom(ctx, []string{"search_index_events"}, []string{"entity_type", "entity_id", "action", "source", "payload"}, newCopyRows(rows))
 		if err != nil {
 			return err
 		}
@@ -285,12 +319,16 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 		fmt.Printf("[worker] inserted=%d/%d\n", inserted, opt.Events)
 	}
 	summary.Inserted = inserted
-	summary.DistinctDocs = opt.DistinctDocs
+	summary.DistinctDocs = len(refs)
+	expectations, err := readWorkerExpectations(ctx, mainPool, runSource, refs)
+	if err != nil {
+		return err
+	}
 
 	deadline := time.Now().Add(time.Duration(opt.WatchSeconds) * time.Second)
 	var previous eventStats
 	for time.Now().Before(deadline) {
-		stats, err := readEventStats(ctx, pool)
+		stats, err := readEventStats(ctx, mainPool)
 		if err != nil {
 			summary.Errors = append(summary.Errors, err.Error())
 			break
@@ -306,7 +344,7 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 		}
 		time.Sleep(time.Duration(opt.PollMS) * time.Millisecond)
 	}
-	after, err := readEventStats(ctx, pool)
+	after, err := readEventStats(ctx, mainPool)
 	if err != nil {
 		return err
 	}
@@ -314,6 +352,13 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 	summary.FinishedAt = time.Now().Format(time.RFC3339Nano)
 	expectedTotal := before.Total + int64(inserted)
 	summary.PossibleLostEvents = after.Total < expectedTotal
+	verificationErr := errors.Join(
+		verifyGeneratedEventsProcessed(ctx, mainPool, runSource),
+		verifyWorkerResults(ctx, indexPool, expectations),
+	)
+	if verificationErr != nil {
+		summary.Errors = append(summary.Errors, verificationErr.Error())
+	}
 	writeReport(summary, true)
 	if opt.RequireDrained && after.Backlog > 0 {
 		return fmt.Errorf("backlog not drained: %d", after.Backlog)
@@ -321,7 +366,134 @@ func runWorker(ctx context.Context, opt workerOptions) error {
 	if summary.PossibleLostEvents {
 		return fmt.Errorf("possible lost events: expected total >= %d got %d", expectedTotal, after.Total)
 	}
+	if verificationErr != nil {
+		return verificationErr
+	}
 	return nil
+}
+
+func loadWorkerSourceReferences(ctx context.Context, service *indexer.Service, limit int) ([]indexer.SourceEntityReference, error) {
+	refs := make([]indexer.SourceEntityReference, 0, limit)
+	for _, entityType := range indexer.EntityTypes {
+		remaining := limit - len(refs)
+		if remaining == 0 {
+			break
+		}
+		batch, err := service.SourceEntityReferences(ctx, entityType, remaining)
+		if err != nil {
+			return nil, fmt.Errorf("read %s source fixtures: %w", entityType, err)
+		}
+		refs = append(refs, batch...)
+	}
+	if len(refs) == 0 {
+		return nil, errors.New("no source entities are available for worker stability events")
+	}
+	return refs, nil
+}
+
+func buildWorkerEvents(rng *rand.Rand, refs []indexer.SourceEntityReference, start, count int, duplicateRatio float64, seed int64) ([]workerEvent, error) {
+	if len(refs) == 0 {
+		return nil, errors.New("worker events require source entity references")
+	}
+	events := make([]workerEvent, 0, count)
+	for i := 0; i < count; i++ {
+		refIndex := start + i
+		if rng.Float64() < duplicateRatio {
+			refIndex = rng.Intn(len(refs))
+		}
+		ref := refs[refIndex%len(refs)]
+		payloadJSON, err := json.Marshal(map[string]any{
+			"fixture": true,
+			"seq":     start + i,
+			"seed":    seed,
+		})
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, workerEvent{
+			EntityType: ref.EntityType,
+			EntityID:   ref.EntityID,
+			Action:     "upsert",
+			Payload:    string(payloadJSON),
+		})
+	}
+	return events, nil
+}
+
+func readWorkerExpectations(ctx context.Context, mainDB *pgxpool.Pool, source string, refs []indexer.SourceEntityReference) ([]workerExpectation, error) {
+	references := make(map[string]indexer.SourceEntityReference, len(refs))
+	for _, ref := range refs {
+		references[workerEntityKey(ref.EntityType, ref.EntityID)] = ref
+	}
+	rows, err := mainDB.Query(ctx, `SELECT entity_type,entity_id,max(event_order),bool_and(action='upsert')
+		FROM search_index_events WHERE source=$1 GROUP BY entity_type,entity_id`, source)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	expectations := []workerExpectation{}
+	for rows.Next() {
+		var entityType, entityID string
+		var sourceVersion int64
+		var allUpserts bool
+		if err := rows.Scan(&entityType, &entityID, &sourceVersion, &allUpserts); err != nil {
+			return nil, err
+		}
+		if !allUpserts {
+			return nil, fmt.Errorf("generated events include a destructive action for %s/%s", entityType, entityID)
+		}
+		ref, ok := references[workerEntityKey(entityType, entityID)]
+		if !ok {
+			return nil, fmt.Errorf("generated event targets an unsampled source entity %s/%s", entityType, entityID)
+		}
+		expectations = append(expectations, workerExpectation{Reference: ref, SourceVersion: sourceVersion})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(expectations) == 0 {
+		return nil, errors.New("no generated worker events were found")
+	}
+	return expectations, nil
+}
+
+func verifyGeneratedEventsProcessed(ctx context.Context, mainDB *pgxpool.Pool, source string) error {
+	var total, processed, failed int64
+	if err := mainDB.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE processed_at IS NOT NULL),count(*) FILTER (WHERE failed_at IS NOT NULL)
+		FROM search_index_events WHERE source=$1`, source).Scan(&total, &processed, &failed); err != nil {
+		return err
+	}
+	if total == 0 || processed != total || failed != 0 {
+		return fmt.Errorf("generated worker events not fully processed: total=%d processed=%d failed=%d", total, processed, failed)
+	}
+	return nil
+}
+
+func verifyWorkerResults(ctx context.Context, indexDB *pgxpool.Pool, expectations []workerExpectation) error {
+	for _, expected := range expectations {
+		var title, status string
+		var updatedAt time.Time
+		var sourceVersion int64
+		err := indexDB.QueryRow(ctx, `SELECT s.title,s.status,s.updated_at,s.source_version
+			FROM search_index s JOIN index_generations g ON g.id=s.generation_id
+			WHERE g.status='active' AND s.entity_type=$1 AND s.entity_id=$2`,
+			expected.Reference.EntityType, expected.Reference.EntityID,
+		).Scan(&title, &status, &updatedAt, &sourceVersion)
+		if err != nil {
+			return fmt.Errorf("verify indexed source %s/%s: %w", expected.Reference.EntityType, expected.Reference.EntityID, err)
+		}
+		if status == "deleted" || title != expected.Reference.Title || !updatedAt.Equal(expected.Reference.UpdatedAt) {
+			return fmt.Errorf("indexed source content mismatch for %s/%s", expected.Reference.EntityType, expected.Reference.EntityID)
+		}
+		if sourceVersion < expected.SourceVersion {
+			return fmt.Errorf("indexed source version %d is older than generated event %d for %s/%s", sourceVersion, expected.SourceVersion, expected.Reference.EntityType, expected.Reference.EntityID)
+		}
+	}
+	return nil
+}
+
+func workerEntityKey(entityType, entityID string) string {
+	return entityType + "\x00" + entityID
 }
 
 func runQuery(ctx context.Context, opt queryOptions) error {
@@ -335,7 +507,7 @@ func runQuery(ctx context.Context, opt queryOptions) error {
 	started := time.Now()
 	jobs := make(chan struct {
 		class string
-		query string
+		query queryCase
 	}, opt.PerClass*len(queryClasses))
 	results := make(chan querySample, cap(jobs))
 	var wg sync.WaitGroup
@@ -354,7 +526,7 @@ func runQuery(ctx context.Context, opt queryOptions) error {
 		for i := 0; i < opt.PerClass; i++ {
 			jobs <- struct {
 				class string
-				query string
+				query queryCase
 			}{class: class, query: queries[rng.Intn(len(queries))]}
 			totalJobs++
 		}
@@ -390,17 +562,34 @@ func runQuery(ctx context.Context, opt queryOptions) error {
 		for _, q := range queries[:min(2, len(queries))] {
 			check, cursor := checkQueryStability(ctx, client, opt, class, q)
 			summary.Stability = append(summary.Stability, check)
-			if opt.CheckCursor {
+			if opt.CheckCursor && q.ExpectedErrorCode == "" {
 				summary.CursorChecks = append(summary.CursorChecks, cursor)
 			}
 		}
 	}
+	if summary.Overall.Failures > 0 {
+		summary.Errors = append(summary.Errors, fmt.Sprintf("%d query samples failed", summary.Overall.Failures))
+	}
+	for _, check := range summary.Stability {
+		if !check.Stable {
+			summary.Errors = append(summary.Errors, fmt.Sprintf("unstable top results for %s/%s", check.Class, check.Query))
+		}
+	}
+	for _, check := range summary.CursorChecks {
+		if !check.Stable {
+			summary.Errors = append(summary.Errors, fmt.Sprintf("unstable cursor results for %s/%s", check.Class, check.Query))
+		}
+	}
 	writeReport(summary, opt.OutputPretty)
+	if len(summary.Errors) > 0 {
+		return fmt.Errorf("query validation failed: %s", strings.Join(summary.Errors, "; "))
+	}
 	return nil
 }
 
-func executeQuery(ctx context.Context, client *http.Client, opt queryOptions, class, query, cursor string) querySample {
+func executeQuery(ctx context.Context, client *http.Client, opt queryOptions, class string, queryCase queryCase, cursor string) querySample {
 	started := time.Now()
+	query := queryCase.Query
 	body := map[string]any{"q": query, "limit": opt.Limit, "explain": true}
 	if cursor != "" {
 		body["cursor"] = cursor
@@ -420,12 +609,35 @@ func executeQuery(ctx context.Context, client *http.Client, opt queryOptions, cl
 		return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: err.Error()}
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
+	if resp.Request != nil && resp.Request.Response != nil {
+		return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: "search request followed a redirect"}
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: err.Error()}
+	}
+	if queryCase.ExpectedErrorCode != "" {
+		var parsed struct {
+			Error struct {
+				Code string `json:"code"`
+			} `json:"error"`
+		}
+		if err := json.Unmarshal(data, &parsed); err != nil {
+			return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: err.Error()}
+		}
+		if resp.StatusCode != queryCase.ExpectedStatus || parsed.Error.Code != queryCase.ExpectedErrorCode {
+			return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true,
+				Error: fmt.Sprintf("expected HTTP %d error %q, got HTTP %d error %q", queryCase.ExpectedStatus, queryCase.ExpectedErrorCode, resp.StatusCode, parsed.Error.Code)}
+		}
+		return querySample{Class: class, Query: query, LatencyMS: latency}
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: string(data)}
 	}
-	var parsed searchResponse
-	_ = json.Unmarshal(data, &parsed)
+	parsed, err := decodeSearchResponse(data)
+	if err != nil {
+		return querySample{Class: class, Query: query, LatencyMS: latency, Failed: true, Error: err.Error()}
+	}
 	timing := parsed.Timing
 	if timing.CandidateSize == 0 && parsed.Debug.Timing.CandidateSize > 0 {
 		timing = parsed.Debug.Timing
@@ -453,19 +665,63 @@ func executeQuery(ctx context.Context, client *http.Client, opt queryOptions, cl
 	}
 }
 
-func checkQueryStability(ctx context.Context, client *http.Client, opt queryOptions, class, query string) (stabilityCheck, cursorCheck) {
+func decodeSearchResponse(data []byte) (searchResponse, error) {
+	var envelope map[string]json.RawMessage
+	if err := json.Unmarshal(data, &envelope); err != nil {
+		return searchResponse{}, err
+	}
+	if envelope == nil {
+		return searchResponse{}, errors.New("search response must be an object")
+	}
+	items, ok := envelope["items"]
+	if !ok || bytes.Equal(bytes.TrimSpace(items), []byte("null")) {
+		return searchResponse{}, errors.New("search response items must be an array")
+	}
+	var itemList []json.RawMessage
+	if err := json.Unmarshal(items, &itemList); err != nil {
+		return searchResponse{}, errors.New("search response items must be an array")
+	}
+	var parsed searchResponse
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return searchResponse{}, err
+	}
+	return parsed, nil
+}
+
+func checkQueryStability(ctx context.Context, client *http.Client, opt queryOptions, class string, query queryCase) (stabilityCheck, cursorCheck) {
 	var expected []string
-	check := stabilityCheck{Class: class, Query: query, Stable: true}
-	cursor := cursorCheck{Class: class, Query: query, Stable: true}
+	check := stabilityCheck{Class: class, Query: query.Query, Stable: true, ExpectedStatus: query.ExpectedStatus, ExpectedErrorCode: query.ExpectedErrorCode}
+	cursor := cursorCheck{Class: class, Query: query.Query, Stable: true}
 	var expectedSecond []string
+	expectedHasCursor := false
 	for i := 0; i < 10; i++ {
 		first := executeQuery(ctx, client, opt, class, query, "")
+		if first.Failed {
+			check.Stable = false
+			check.MismatchAt = i
+			check.Error = first.Error
+			cursor.Stable = false
+			cursor.MismatchAt = i
+			cursor.Error = first.Error
+			break
+		}
+		if query.ExpectedErrorCode != "" {
+			// Each sample must satisfy the same status/code contract. Error
+			// responses have no result ordering or cursor pagination to test.
+			continue
+		}
 		if i == 0 {
 			expected = first.TopIDs
 			check.ExpectedTop10 = expected
 			cursor.FirstPage = expected
-			if first.NextCursor != "" {
+			expectedHasCursor = first.NextCursor != ""
+			if opt.CheckCursor && expectedHasCursor {
 				second := executeQuery(ctx, client, opt, class, query, first.NextCursor)
+				if second.Failed {
+					cursor.Stable = false
+					cursor.Error = second.Error
+					continue
+				}
 				expectedSecond = second.TopIDs
 				cursor.SecondPage = expectedSecond
 				cursor.Overlap = intersect(expected, expectedSecond)
@@ -475,19 +731,30 @@ func checkQueryStability(ctx context.Context, client *http.Client, opt queryOpti
 			}
 			continue
 		}
+		if opt.CheckCursor {
+			hasCursor := first.NextCursor != ""
+			if hasCursor != expectedHasCursor {
+				cursor.Stable = false
+				cursor.MismatchAt = i
+				cursor.Error = "first-page cursor presence changed"
+			} else if expectedHasCursor {
+				second := executeQuery(ctx, client, opt, class, query, first.NextCursor)
+				if second.Failed {
+					cursor.Stable = false
+					cursor.MismatchAt = i
+					cursor.Error = second.Error
+				} else if !sameStrings(expectedSecond, second.TopIDs) {
+					cursor.Stable = false
+					cursor.MismatchAt = i
+					cursor.ActualPage2 = second.TopIDs
+				}
+			}
+		}
 		if !sameStrings(expected, first.TopIDs) {
 			check.Stable = false
 			check.MismatchAt = i
 			check.ActualTop10 = first.TopIDs
 			break
-		}
-		if opt.CheckCursor && first.NextCursor != "" && len(expectedSecond) > 0 {
-			second := executeQuery(ctx, client, opt, class, query, first.NextCursor)
-			if !sameStrings(expectedSecond, second.TopIDs) {
-				cursor.Stable = false
-				cursor.MismatchAt = i
-				cursor.ActualPage2 = second.TopIDs
-			}
 		}
 	}
 	return check, cursor
@@ -564,11 +831,6 @@ func (r *copyRows) Values() ([]any, error) {
 }
 
 func (r *copyRows) Err() error { return nil }
-
-func stableID(entityType string, i int) string {
-	sum := sha1.Sum([]byte(entityType + ":" + strconv.Itoa(i)))
-	return entityType + "-" + hex.EncodeToString(sum[:])[:16]
-}
 
 func percentile(values []int64, p int) int64 {
 	if len(values) == 0 {

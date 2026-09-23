@@ -69,7 +69,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	runtimeConfig, err := runtimeConfigFromAppConfig(cfg)
+	runtimeLoader := func() (indexer.RuntimeConfig, error) { return runtimeConfigFromAppConfig(cfg) }
+	runtimeConfig, err := runtimeLoader()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -78,6 +79,9 @@ func main() {
 		cursorSecret = cfg.APIToken
 	}
 	indexService := indexer.NewServiceWithRuntimeAndCursor(pools.Main, pools.Index, runtimeConfig, cursorSecret)
+	if err := indexService.RecoverStaleRebuilds(ctx); err != nil {
+		log.Fatal(fmt.Errorf("recover stale rebuilds: %w", err))
+	}
 	var cacheClient *edgecache.Client
 	if cfg.EdgeCacheEnabled {
 		cacheClient = edgecache.New(edgecache.Options{
@@ -94,9 +98,10 @@ func main() {
 		HighlightTTLSeconds: int64(cfg.EdgeCacheHighlightTTLSeconds),
 	})
 	httpSrv := server.NewHTTPServer(indexService, server.Options{
-		AuthToken:         cfg.APIToken,
-		RequestTimeout:    time.Duration(cfg.RequestTimeoutMS) * time.Millisecond,
-		RuntimeConfigFile: cfg.RuntimeConfigFile,
+		AuthToken:           cfg.APIToken,
+		RequestTimeout:      time.Duration(cfg.RequestTimeoutMS) * time.Millisecond,
+		RuntimeConfigFile:   cfg.RuntimeConfigFile,
+		RuntimeConfigLoader: runtimeLoader,
 		Cache: server.CacheOptions{
 			Cache:               cache,
 			TTLSeconds:          int64(cfg.EdgeCacheTTLSeconds),
@@ -106,6 +111,7 @@ func main() {
 			Namespace:           cfg.CacheNamespace,
 		},
 	})
+	indexService.SetMutationRunner(httpSrv.RunMutation)
 	worker := indexer.NewWorker(indexService, indexer.WorkerOptions{
 		Enabled:          cfg.WorkerEnabled,
 		BatchSize:        cfg.WorkerBatchSize,
@@ -113,7 +119,8 @@ func main() {
 		LockTTL:          time.Duration(cfg.WorkerLockTTLMS) * time.Millisecond,
 		RetryDelay:       time.Duration(cfg.WorkerRetryDelayMS) * time.Millisecond,
 		MaxAttempts:      cfg.WorkerMaxAttempts,
-		CacheInvalidator: httpSrv.InvalidateSearchCache,
+		MutationRunner:   httpSrv.RunMutation,
+		OperationTimeout: time.Duration(cfg.RequestTimeoutMS) * time.Millisecond,
 	})
 	worker.Start(ctx)
 	log.Printf("nexusindex listening on http://127.0.0.1:%d", cfg.Port)

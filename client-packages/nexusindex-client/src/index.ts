@@ -205,8 +205,10 @@ export class NexusIndexClient {
     return this.postJson<RuntimeConfig>('/api/config/reload', {});
   }
 
-  getCacheStats(): Promise<CacheStats> {
-    return this.transport.requestJson<CacheStats>('/api/cache/stats');
+  async getCacheStats(): Promise<CacheStats> {
+    const result = await this.transport.requestJson<{cacheVersion: number; stats?: CacheStats}>('/api/cache/stats');
+    if (!result.stats) throw new Error('NexusIndex cache statistics are unavailable');
+    return result.stats;
   }
 
   prewarmCache(queries: SearchParams[]): Promise<{ ok: boolean; warmed: number }> {

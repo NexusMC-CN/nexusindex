@@ -1,10 +1,50 @@
 package indexer
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// These cases catch synonym conjunctions, dictionary prefix splitting, and
+// different token boundaries between the index and query paths.
+func TestQuerySynonymAlternativesAndSharedTokens(t *testing.T) {
+	cfg := DefaultRuntimeConfig().Query
+	for _, tc := range []struct {
+		raw, want string
+	}{
+		{"模组", "(('模' & '组') | 'mod' | 'mods')"},
+		{"modern", "'modern'"},
+		{"hello世界", "'hello' & '世' & '界'"},
+		{"1.20.1", "'1.20.1'"},
+		{"テスト", "'テスト'"},
+	} {
+		t.Run(tc.raw, func(t *testing.T) {
+			if got := NewQueryPipeline().Build(tc.raw, cfg).TSQueryText; got != tc.want {
+				t.Fatalf("query %q: got %q, want %q", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTokenSearchKeepsVersionsAndPhraseOrder(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want []string
+	}{
+		{"hello世界", []string{"hello", "世", "界"}},
+		{"1.20.1", []string{"1.20.1"}},
+		{"fabric api fabric", []string{"fabric", "api", "fabric"}},
+	} {
+		if got := tokenizeForSearch(tc.raw); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("tokenize %q: got %#v, want %#v", tc.raw, got, tc.want)
+		}
+	}
+	if got := ftsText("fabric api fabric"); got != "fabric api fabric" {
+		t.Errorf("index text changed phrase positions: %q", got)
+	}
+}
 
 func TestQueryPipelinePreservesOrderAndDictionaryTerms(t *testing.T) {
 	pipeline := NewQueryPipeline()

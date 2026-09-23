@@ -36,10 +36,28 @@ func NewQueryPipeline() *QueryPipeline {
 func (p *QueryPipeline) Build(raw string, cfg QueryConfig) StructuredQuery {
 	normalized := normalizeQueryText(raw)
 	terms := normalizeStringsPreserveOrder(tokenizeWithDictionary(normalized, cfg.Synonyms))
-	expanded := append([]string{}, terms...)
+	expanded := []string{}
+	groups := make([]string, 0, len(terms))
 	for _, term := range terms {
+		tokens := tokenizeForSearch(term)
+		expanded = append(expanded, tokens...)
+		alternatives := []string{compileSearchTokens(tokens, false)}
 		for _, synonym := range cfg.Synonyms[term] {
-			expanded = append(expanded, tokenizeForSearch(synonym)...)
+			synonymTokens := tokenizeForSearch(synonym)
+			if expression := compileSearchTokens(synonymTokens, false); expression != "" {
+				alternatives = append(alternatives, expression)
+				expanded = append(expanded, synonymTokens...)
+			}
+		}
+		if len(alternatives) > 1 {
+			for i, alternative := range alternatives {
+				if strings.Contains(alternative, " & ") {
+					alternatives[i] = "(" + alternative + ")"
+				}
+			}
+			groups = append(groups, "("+strings.Join(alternatives, " | ")+")")
+		} else if alternatives[0] != "" {
+			groups = append(groups, alternatives[0])
 		}
 	}
 	expanded = normalizeStringsPreserveOrder(expanded)
@@ -69,7 +87,7 @@ func (p *QueryPipeline) Build(raw string, cfg QueryConfig) StructuredQuery {
 		Normalized:    normalized,
 		Terms:         terms,
 		ExpandedTerms: expanded,
-		TSQueryText:   strings.Join(expanded, " "),
+		TSQueryText:   strings.Join(groups, " & "),
 		Versions:      versions,
 		Loaders:       loaders,
 		Boosts:        boosts,
@@ -84,7 +102,7 @@ func normalizeQueryText(value string) string {
 	var b strings.Builder
 	lastSpace := false
 	for _, r := range value {
-		keep := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || isHan(r) || r == '.' || r == '-' || r == '_' || r == '/'
+		keep := unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == '.' || r == '-' || r == '_' || r == '/'
 		if keep {
 			b.WriteRune(r)
 			lastSpace = false
@@ -112,16 +130,26 @@ func tokenizeWithDictionary(value string, dictionary map[string][]string) []stri
 		}
 	}
 	sort.Slice(keys, func(i, j int) bool {
+		if len([]rune(keys[i])) == len([]rune(keys[j])) {
+			return keys[i] < keys[j]
+		}
 		return len([]rune(keys[i])) > len([]rune(keys[j]))
 	})
 
 	tokens := []string{}
 	runes := []rune(value)
 	for i := 0; i < len(runes); {
-		remaining := string(runes[i:])
+		remaining := ""
+		if len(keys) > 0 {
+			remaining = string(runes[i:])
+		}
 		matched := ""
 		for _, key := range keys {
-			if strings.HasPrefix(remaining, key) {
+			keyRunes := []rune(key)
+			end := i + len(keyRunes)
+			leftBoundary := isHan(keyRunes[0]) || i == 0 || !isSearchWordRune(runes[i-1])
+			rightBoundary := isHan(keyRunes[len(keyRunes)-1]) || end == len(runes) || (end < len(runes) && !isSearchWordRune(runes[end]))
+			if leftBoundary && rightBoundary && strings.HasPrefix(remaining, key) {
 				matched = key
 				break
 			}
@@ -137,17 +165,17 @@ func tokenizeWithDictionary(value string, dictionary map[string][]string) []stri
 			i++
 			continue
 		}
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '-' || r == '.' {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
 			start := i
 			i++
 			for i < len(runes) {
 				next := runes[i]
-				if !(unicode.IsLetter(next) || unicode.IsDigit(next) || next == '_' || next == '-' || next == '.') {
+				if isHan(next) || !isSearchWordRune(next) {
 					break
 				}
 				i++
 			}
-			token := strings.Trim(string(runes[start:i]), ".")
+			token := strings.TrimRight(string(runes[start:i]), ".-_")
 			if token != "" {
 				tokens = append(tokens, token)
 			}
@@ -156,6 +184,22 @@ func tokenizeWithDictionary(value string, dictionary map[string][]string) []stri
 		i++
 	}
 	return tokens
+}
+
+func isSearchWordRune(r rune) bool {
+	return !isHan(r) && (unicode.IsLetter(r) || unicode.IsDigit(r) || unicode.IsMark(r) || r == '_' || r == '-' || r == '.')
+}
+
+func compileSearchTokens(tokens []string, prefix bool) string {
+	parts := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		quoted := "'" + strings.NewReplacer(`\`, `\\`, "'", "''").Replace(token) + "'"
+		if prefix {
+			quoted += ":*"
+		}
+		parts = append(parts, quoted)
+	}
+	return strings.Join(parts, " & ")
 }
 
 func normalizeStringsPreserveOrder(values []string) []string {

@@ -44,6 +44,8 @@ type SearchDocument struct {
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 	SourceVersion int64
+	// Source body used only to build search_vector; never serialized or returned.
+	indexText string
 }
 
 type SearchResult struct {
@@ -105,7 +107,8 @@ type SearchTiming struct {
 	ScoringMS     int64 `json:"scoring_ms"`
 	HighlightMS   int64 `json:"highlight_ms"`
 	CandidateSize int   `json:"candidate_size,omitempty"`
-	IndexLagMS    int64 `json:"index_lag_ms,omitempty"`
+	// Nil means not requested or unavailable; a successful empty backlog is 0.
+	IndexLagMS *int64 `json:"index_lag_ms,omitempty"`
 }
 
 type TagResult struct {

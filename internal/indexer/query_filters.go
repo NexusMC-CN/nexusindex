@@ -2,6 +2,8 @@ package indexer
 
 import (
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -12,7 +14,7 @@ func appendSearchFilters(where []string, args []any, filters SearchFilters) ([]s
 	if values := anyText(filters.EntityTypes); len(values) > 0 {
 		where = append(where, "s.entity_type = ANY("+add(values)+"::text[])")
 	}
-	if values := anyText(filters.CategoryIDs); len(values) > 0 {
+	if values := literalFilterValues(filters.CategoryIDs); len(values) > 0 {
 		where = append(where, "s.category_id = ANY("+add(values)+"::text[])")
 	}
 	if values := anyText(filters.Statuses); len(values) > 0 {
@@ -41,7 +43,8 @@ func appendSearchFilters(where []string, args []any, filters SearchFilters) ([]s
 func appendVersionRange(where []string, args []any, value VersionRange) ([]string, []any) {
 	bounds := []struct{ op, raw string }{{">=", value.GTE}, {">", value.GT}, {"<=", value.LTE}, {"<", value.LT}}
 	conditions := []string{}
-	expression := `(split_part(v, '.', 1)::int * 1000000 + coalesce(nullif(split_part(v, '.', 2), '')::int, 0) * 1000 + coalesce(nullif(split_part(v, '.', 3), '')::int, 0))`
+	// CASE protects casts even when PostgreSQL reorders WHERE predicates.
+	expression := `(CASE WHEN v ~ '^[0-9]{1,3}([.][0-9]{1,3}){0,2}$' THEN split_part(v, '.', 1)::int * 1000000 + coalesce(nullif(split_part(v, '.', 2), '')::int, 0) * 1000 + coalesce(nullif(split_part(v, '.', 3), '')::int, 0) END)`
 	for _, bound := range bounds {
 		key, ok := minecraftVersionKey(bound.raw)
 		if !ok {
@@ -54,25 +57,41 @@ func appendVersionRange(where []string, args []any, value VersionRange) ([]strin
 		return where, args
 	}
 	versions := `CASE WHEN jsonb_typeof(s.payload->'mcVersions') = 'array' THEN s.payload->'mcVersions' WHEN jsonb_typeof(s.payload->'versions') = 'array' THEN s.payload->'versions' ELSE '[]'::jsonb END`
-	where = append(where, "EXISTS (SELECT 1 FROM jsonb_array_elements_text("+versions+") AS versions(v) WHERE v ~ '^[0-9]+([.][0-9]+){0,2}$' AND "+strings.Join(conditions, " AND ")+")")
+	where = append(where, "EXISTS (SELECT 1 FROM jsonb_array_elements_text("+versions+") AS versions(v) WHERE "+strings.Join(conditions, " AND ")+")")
 	return where, args
 }
 
+var minecraftVersionPattern = regexp.MustCompile(`^[0-9]{1,3}(\.[0-9]{1,3}){0,2}$`)
+
 func minecraftVersionKey(raw string) (int, bool) {
-	parts := strings.Split(strings.TrimPrefix(strings.TrimSpace(raw), "v"), ".")
-	if len(parts) == 0 || len(parts) > 3 {
+	raw = strings.TrimPrefix(strings.TrimSpace(raw), "v")
+	if !minecraftVersionPattern.MatchString(raw) {
 		return 0, false
 	}
+	parts := strings.Split(raw, ".")
 	multipliers := []int{1000000, 1000, 1}
 	key := 0
 	for i, part := range parts {
-		var n int
-		if _, err := fmt.Sscanf(part, "%d", &n); err != nil || n < 0 || n > 999 {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 || n > 999 {
 			return 0, false
 		}
 		key += n * multipliers[i]
 	}
 	return key, true
+}
+
+func literalFilterValues(values []string) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" && !seen[value] {
+			seen[value] = true
+			out = append(out, value)
+		}
+	}
+	return out
 }
 
 func appendNumericRange(where []string, args []any, column string, value NumericRange) ([]string, []any) {
@@ -101,7 +120,11 @@ func appendTimeRange(where []string, args []any, column string, value TimeRange)
 	return where, args
 }
 
-func appendClauses(where []string, args []any, must, should, mustNot []QueryClause) ([]string, []any, error) {
+func appendClauses(where []string, args []any, must, should, mustNot []QueryClause, configs ...QueryConfig) ([]string, []any, error) {
+	cfg := QueryConfig{}
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
 	addGroup := func(clauses []QueryClause, joiner string, negate bool) error {
 		expressions := []string{}
 		for _, clause := range clauses {
@@ -111,32 +134,44 @@ func appendClauses(where []string, args []any, must, should, mustNot []QueryClau
 			}
 			field := strings.ToLower(strings.TrimSpace(clause.Field))
 			column := "s.search_vector"
-			textColumn := "s.title || ' ' || array_to_string(s.tags, ' ') || ' ' || array_to_string(s.keywords, ' ')"
+			textColumn := "s.title || ' ' || array_to_string(s.tags, ' ') || ' ' || array_to_string(s.keywords, ' ') || ' ' || coalesce(s.payload::text, '')"
 			switch field {
 			case "_all":
 			case "title":
-				column = "to_tsvector('simple', s.title)"
+				column = `ts_filter(s.search_vector, '{A}')`
 				textColumn = "s.title"
 			case "tags":
-				column = "to_tsvector('simple', array_to_string(s.tags, ' '))"
+				column = `ts_filter(s.search_vector, '{B}')`
 				textColumn = "array_to_string(s.tags, ' ')"
 			case "keywords":
-				column = "to_tsvector('simple', array_to_string(s.keywords, ' '))"
+				column = `ts_filter(s.search_vector, '{C}')`
 				textColumn = "array_to_string(s.keywords, ' ')"
 			default:
 				return &QueryError{Code: "invalid_query_field", Message: "unsupported query field"}
 			}
 			value := strings.TrimSpace(clause.Value)
+			tokens := tokenizeForSearch(value)
+			if len(tokens) == 0 {
+				return &QueryError{Code: "invalid_query_clause", Message: "query clause must contain searchable text"}
+			}
+			switch operator {
+			case "match":
+				value = NewQueryPipeline().Build(value, cfg).TSQueryText
+			case "phrase":
+				value = strings.Join(tokens, " ")
+			case "prefix":
+				value = compileSearchTokens(tokens, true)
+			}
 			args = append(args, value)
 			argument := "$" + fmt.Sprint(len(args))
 			expression := ""
 			switch operator {
 			case "match":
-				expression = column + " @@ plainto_tsquery('simple', " + argument + ")"
+				expression = column + " @@ to_tsquery('simple', " + argument + ")"
 			case "phrase":
 				expression = column + " @@ phraseto_tsquery('simple', " + argument + ")"
 			case "prefix":
-				expression = column + " @@ to_tsquery('simple', " + argument + " || ':*')"
+				expression = column + " @@ to_tsquery('simple', " + argument + ")"
 			case "fuzzy":
 				expression = "similarity(lower(" + textColumn + "), lower(" + argument + ")) >= 0.35"
 			default:

@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/url"
 	"testing"
-	"time"
 
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/indexer"
 )
@@ -22,7 +21,7 @@ func (f *fakeCache) Set(context.Context, string, any, int64) {}
 
 func (f *fakeCache) Clear(context.Context, string) {}
 
-func TestTieredCacheL2BackfillUsesResourceTTL(t *testing.T) {
+func TestTieredCacheDoesNotBackfillWithoutRemainingTTL(t *testing.T) {
 	l2 := &fakeCache{value: json.RawMessage(`{"ok":true}`)}
 	cache := NewTieredCache(TieredCacheOptions{
 		L1MaxEntries:        8,
@@ -37,12 +36,53 @@ func TestTieredCacheL2BackfillUsesResourceTTL(t *testing.T) {
 	if _, ok := cache.Get(context.Background(), key); !ok {
 		t.Fatal("expected L2 hit")
 	}
-	cache.mu.Lock()
-	entry := cache.l1[key]
-	ttl := time.Until(entry.expiresAt)
-	cache.mu.Unlock()
-	if ttl > 6*time.Second || ttl < 3*time.Second {
-		t.Fatalf("expected query ttl around 5s, got %s", ttl)
+	l2.value = nil
+	if _, ok := cache.Get(context.Background(), key); ok {
+		t.Fatal("unknown L2 lifetime must not be extended by L1 backfill")
+	}
+}
+
+func TestDisabledEdgeCacheMissDoesNotPanic(t *testing.T) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Errorf("disabled L2 panicked: %v", recovered)
+		}
+	}()
+	cache := NewTieredCache(TieredCacheOptions{L2: NewEdgeCacheAdapter(nil)})
+	if _, hit := cache.Get(context.Background(), "missing"); hit {
+		t.Fatal("unexpected hit")
+	}
+}
+
+func TestTieredCacheUpdateAtCapacityPreservesOtherKeys(t *testing.T) {
+	cache := NewTieredCache(TieredCacheOptions{L1MaxEntries: 2})
+	ctx := context.Background()
+	cache.Set(ctx, "a", "first", 60)
+	cache.Set(ctx, "b", "keep", 20)
+	cache.Set(ctx, "a", "updated", 60)
+	if value, ok := cache.Get(ctx, "b"); !ok || string(value) != `"keep"` {
+		t.Fatal("updating a evicted b")
+	}
+	if value, ok := cache.Get(ctx, "a"); !ok || string(value) != `"updated"` {
+		t.Fatal("a was not updated")
+	}
+}
+
+func TestTieredCacheExactClearPreservesPrefixNeighbors(t *testing.T) {
+	cache := NewTieredCache(TieredCacheOptions{})
+	ctx := context.Background()
+	cache.Set(ctx, "abc", true, 60)
+	cache.Set(ctx, "abcdef", true, 60)
+	cache.Clear(ctx, "abc")
+	if _, ok := cache.Get(ctx, "abc"); ok {
+		t.Fatal("exact key survived clear")
+	}
+	if _, ok := cache.Get(ctx, "abcdef"); !ok {
+		t.Fatal("exact clear removed prefix neighbor")
+	}
+	cache.Clear(ctx, "abc*")
+	if _, ok := cache.Get(ctx, "abcdef"); ok {
+		t.Fatal("glob clear did not remove neighbor")
 	}
 }
 
@@ -50,9 +90,9 @@ func TestCacheKeyVersionBump(t *testing.T) {
 	cache := NewTieredCache(TieredCacheOptions{L1MaxEntries: 8})
 	server := NewHTTPServer(nil, Options{Cache: CacheOptions{Cache: cache, Namespace: "nexusindex:test"}})
 	values := url.Values{"q": []string{"fabric"}}
-	before := server.cacheKey("query", values)
+	before, _ := server.scopedCacheKey(server.withCacheScope(context.Background()), "query", values)
 	server.clearCachedSearch(context.Background())
-	after := server.cacheKey("query", values)
+	after, _ := server.scopedCacheKey(server.withCacheScope(context.Background()), "query", values)
 	if before == after {
 		t.Fatal("expected cache key to change after version bump")
 	}

@@ -1,10 +1,49 @@
 package indexer
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestVersionRejectsTrailingGarbageAndOverflow(t *testing.T) {
+	for _, raw := range []string{"1.20.1junk", "2148.0.0", "1.+20.1", "1.20.-1", "1.20.1.0"} {
+		if key, ok := minecraftVersionKey(raw); ok {
+			t.Errorf("accepted invalid version %q as %d", raw, key)
+		}
+		if err := validateFilters(SearchFilters{MinecraftVersion: VersionRange{GTE: raw}}); err == nil {
+			t.Errorf("filter validation accepted %q", raw)
+		}
+	}
+}
+
+func TestClausePrefixCompilesEveryToken(t *testing.T) {
+	where, args, err := appendClauses(nil, nil, []QueryClause{{Field: "_all", Operator: "prefix", Value: "fabric api"}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(args, []any{"'fabric':* & 'api':*"}) {
+		t.Fatalf("prefix bound an unsafe multiword query: %#v", args)
+	}
+	if want := []string{"(s.search_vector @@ to_tsquery('simple', $1))"}; !reflect.DeepEqual(where, want) {
+		t.Fatalf("compiled prefix: %#v", where)
+	}
+}
+
+func TestClauseSymbolsCannotBecomeAnEmptyQuery(t *testing.T) {
+	_, _, err := appendClauses(nil, nil, []QueryClause{{Field: "_all", Value: "???"}}, nil, nil)
+	if _, ok := err.(*QueryError); !ok {
+		t.Fatalf("expected typed validation error, got %v", err)
+	}
+}
+
+func TestSearchCategoryFilterPreservesLiteralID(t *testing.T) {
+	_, args := appendSearchFilters(nil, nil, SearchFilters{CategoryIDs: []string{"ModPackA"}, TagsAny: []string{"Blockbench"}})
+	if want := []any{[]string{"ModPackA"}, []string{"blockbench"}}; !reflect.DeepEqual(args, want) {
+		t.Fatalf("category/tag normalization differs from storage: %#v", args)
+	}
+}
 
 func TestSearchFiltersCompileMultiValueAndRanges(t *testing.T) {
 	now := time.Now()

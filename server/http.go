@@ -1,12 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -17,21 +19,40 @@ import (
 	"github.com/blockbridge/avmcbbs/apps/nexusindex/internal/indexer"
 )
 
+type indexService interface {
+	Ping(context.Context) error
+	Status(context.Context) (indexer.Status, error)
+	SearchWithSnapshot(context.Context, indexer.SearchQuery, indexer.RuntimeSnapshot) (indexer.SearchPage, error)
+	Tags(context.Context, string, string, int, int) ([]indexer.TagResult, int64, error)
+	RuntimeConfig() indexer.RuntimeConfig
+	UpdateRuntimeConfig(context.Context, indexer.RuntimeConfig) indexer.RuntimeConfig
+	PatchRuntimeConfig(context.Context, indexer.RuntimeConfig) indexer.RuntimeConfig
+	RuntimeSnapshot() indexer.RuntimeSnapshot
+	MarkDeleted(context.Context, string, string) (indexer.WriteResult, error)
+	Upsert(context.Context, indexer.SearchDocument) (indexer.WriteResult, error)
+	StartFullRebuild(context.Context) (indexer.RebuildResult, error)
+	StartEntityRebuild(context.Context, string, string) (indexer.RebuildResult, error)
+}
+
 type HTTPServer struct {
-	indexer           *indexer.Service
-	cache             CacheOptions
-	authToken         string
-	requestTimeout    time.Duration
-	runtimeConfigFile string
-	cacheVersion      atomic.Int64
-	mux               *http.ServeMux
+	indexer             indexService
+	cache               CacheOptions
+	authToken           string
+	requestTimeout      time.Duration
+	runtimeConfigFile   string
+	runtimeConfigLoader func() (indexer.RuntimeConfig, error)
+	cacheVersion        atomic.Int64
+	mutationStarted     atomic.Int64
+	mutationCompleted   atomic.Int64
+	mux                 *http.ServeMux
 }
 
 type Options struct {
-	Cache             CacheOptions
-	AuthToken         string
-	RequestTimeout    time.Duration
-	RuntimeConfigFile string
+	Cache               CacheOptions
+	AuthToken           string
+	RequestTimeout      time.Duration
+	RuntimeConfigFile   string
+	RuntimeConfigLoader func() (indexer.RuntimeConfig, error)
 }
 
 type CacheOptions struct {
@@ -93,15 +114,16 @@ type apiError struct {
 	Message string `json:"message"`
 }
 
-func NewHTTPServer(indexer *indexer.Service, options Options) *HTTPServer {
+func NewHTTPServer(indexer indexService, options Options) *HTTPServer {
 	options = options.normalized()
 	s := &HTTPServer{
-		indexer:           indexer,
-		cache:             options.Cache,
-		authToken:         strings.TrimSpace(options.AuthToken),
-		requestTimeout:    options.RequestTimeout,
-		runtimeConfigFile: strings.TrimSpace(options.RuntimeConfigFile),
-		mux:               http.NewServeMux(),
+		indexer:             indexer,
+		cache:               options.Cache,
+		authToken:           strings.TrimSpace(options.AuthToken),
+		requestTimeout:      options.RequestTimeout,
+		runtimeConfigFile:   strings.TrimSpace(options.RuntimeConfigFile),
+		runtimeConfigLoader: options.RuntimeConfigLoader,
+		mux:                 http.NewServeMux(),
 	}
 	s.cacheVersion.Store(time.Now().UnixNano())
 	s.routes()
@@ -112,8 +134,14 @@ func (s *HTTPServer) Handler() http.Handler {
 	return s.mux
 }
 
-func (s *HTTPServer) InvalidateSearchCache(ctx context.Context) {
-	s.clearCachedSearch(ctx)
+func (s *HTTPServer) InvalidateSearchCache(ctx context.Context) error {
+	return s.runMutation(ctx, func() error { return nil })
+}
+
+// Background mutations use the same shared fence as HTTP mutations. Completion
+// errors reach the worker/job, so an incomplete fence can never imply success.
+func (s *HTTPServer) RunMutation(ctx context.Context, operation func() error) error {
+	return s.runMutation(ctx, operation)
 }
 
 func (o Options) normalized() Options {
@@ -224,7 +252,9 @@ func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	cacheValues := req.cacheValues()
 	cacheResource := req.cacheResource()
+	r = r.WithContext(s.withCacheScope(r.Context()))
 	if cached, ok := s.getCached(r.Context(), cacheResource, cacheValues); ok {
+		cached = cacheHitPayload(cached)
 		w.Header().Set("X-NexusIndex-Cache", "HIT")
 		w.Header().Set("X-NexusIndex-Cache-State", "HIT")
 		w.Header().Set("X-NexusIndex-Cache-Hit", "true")
@@ -239,7 +269,7 @@ func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, queryErr.Code, queryErr.Message)
 			return
 		}
-		if strings.Contains(err.Error(), "invalid cursor") {
+		if errors.Is(err, indexer.ErrInvalidCursor) || errors.Is(err, indexer.ErrCursorMismatch) {
 			writeError(w, http.StatusBadRequest, "invalid_cursor", "invalid cursor")
 			return
 		}
@@ -247,7 +277,7 @@ func (s *HTTPServer) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setCached(r.Context(), cacheResource, cacheValues, payload, s.cacheTTL(cacheResource))
-	cacheState := s.cacheState()
+	cacheState := s.cacheState(r.Context())
 	w.Header().Set("X-NexusIndex-Cache", cacheState)
 	w.Header().Set("X-NexusIndex-Cache-State", cacheState)
 	w.Header().Set("X-NexusIndex-Cache-Hit", "false")
@@ -266,6 +296,7 @@ func (s *HTTPServer) handleTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	cacheValues := req.cacheValues()
+	r = r.WithContext(s.withCacheScope(r.Context()))
 	if cached, ok := s.getCached(r.Context(), "tags", cacheValues); ok {
 		w.Header().Set("X-NexusIndex-Cache", "HIT")
 		writeRawJSON(w, http.StatusOK, cached)
@@ -284,12 +315,13 @@ func (s *HTTPServer) handleTags(w http.ResponseWriter, r *http.Request) {
 		"sort":   req.Sort,
 	}
 	s.setCached(r.Context(), "tags", cacheValues, payload, s.cache.TTLSeconds)
-	w.Header().Set("X-NexusIndex-Cache", s.cacheState())
+	w.Header().Set("X-NexusIndex-Cache", s.cacheState(r.Context()))
 	writeJSON(w, http.StatusOK, payload)
 }
 
 func (s *HTTPServer) searchPayload(ctx context.Context, req searchRequest) (map[string]any, error) {
-	page, err := s.indexer.Search(ctx, indexer.SearchQuery{
+	scope := ctx.Value(cacheScopeKey{}).(cacheScope)
+	page, err := s.indexer.SearchWithSnapshot(ctx, indexer.SearchQuery{
 		Query:      req.Q,
 		Sort:       indexer.SearchSort(req.Sort),
 		Must:       req.Must,
@@ -303,7 +335,7 @@ func (s *HTTPServer) searchPayload(ctx context.Context, req searchRequest) (map[
 		Limit:      req.Limit,
 		Cursor:     req.Cursor,
 		Explain:    req.Explain,
-	})
+	}, scope.snapshot)
 	if err != nil {
 		return nil, err
 	}
@@ -320,18 +352,19 @@ func (s *HTTPServer) searchPayload(ctx context.Context, req searchRequest) (map[
 		"exhausted_candidate_set": page.ExhaustedCandidateSet,
 	}
 	if req.Explain {
-		payload["debug"] = map[string]any{
+		debug := map[string]any{
 			"timing":         page.Timing,
 			"cache_hit":      false,
 			"candidate_size": page.Timing.CandidateSize,
-			"index_lag_ms":   page.Timing.IndexLagMS,
 		}
+		if page.Timing.IndexLagMS != nil {
+			debug["index_lag_ms"] = *page.Timing.IndexLagMS
+		}
+		payload["debug"] = debug
 	} else {
 		payload["timing"] = page.Timing
 	}
-	for _, item := range page.Items {
-		s.setCached(ctx, "highlight", req.highlightCacheValues(item.ID), item.Highlight, s.cache.HighlightTTLSeconds)
-	}
+	s.cacheHighlights(ctx, req, page.Items)
 	return payload, nil
 }
 
@@ -345,8 +378,11 @@ func (s *HTTPServer) handleRuntimeConfig(w http.ResponseWriter, r *http.Request)
 			writeError(w, http.StatusBadRequest, "invalid_json", "invalid json")
 			return
 		}
-		updated := s.indexer.UpdateRuntimeConfig(r.Context(), s.indexer.RuntimeConfig().Merge(override))
-		s.clearCachedSearch(r.Context())
+		var updated indexer.RuntimeConfig
+		if err := s.runMutation(r.Context(), func() error { updated = s.indexer.PatchRuntimeConfig(r.Context(), override); return nil }); err != nil {
+			writeCacheMutationError(w, err)
+			return
+		}
 		writeJSON(w, http.StatusOK, updated)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
@@ -362,13 +398,20 @@ func (s *HTTPServer) handleRuntimeConfigReload(w http.ResponseWriter, r *http.Re
 		writeError(w, http.StatusBadRequest, "runtime_config_file_missing", "NEXUSINDEX_RUNTIME_CONFIG_FILE is not set")
 		return
 	}
-	cfg, err := indexer.LoadRuntimeConfigFile(s.runtimeConfigFile)
+	loader := s.runtimeConfigLoader
+	if loader == nil {
+		loader = func() (indexer.RuntimeConfig, error) { return indexer.LoadRuntimeConfigFile(s.runtimeConfigFile) }
+	}
+	cfg, err := loader()
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "runtime_config_reload_failed", err.Error())
 		return
 	}
-	updated := s.indexer.UpdateRuntimeConfig(r.Context(), cfg)
-	s.clearCachedSearch(r.Context())
+	var updated indexer.RuntimeConfig
+	if err := s.runMutation(r.Context(), func() error { updated = s.indexer.UpdateRuntimeConfig(r.Context(), cfg); return nil }); err != nil {
+		writeCacheMutationError(w, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, updated)
 }
 
@@ -404,30 +447,50 @@ func (s *HTTPServer) handleCachePrewarm(w http.ResponseWriter, r *http.Request) 
 	for _, item := range req.Queries {
 		item = item.normalized()
 		cacheResource := item.cacheResource()
-		payload, err := s.searchPayload(r.Context(), item)
+		ctx := s.withCacheScope(r.Context())
+		payload, err := s.searchPayload(ctx, item)
 		if err != nil {
 			continue
 		}
-		s.setCached(r.Context(), cacheResource, item.cacheValues(), payload, s.cacheTTL(cacheResource))
+		s.setCached(ctx, cacheResource, item.cacheValues(), payload, s.cacheTTL(cacheResource))
 		warmed++
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warmed": warmed})
 }
 
 func (s *HTTPServer) handleIndexDocument(w http.ResponseWriter, r *http.Request) {
-	docID := indexDocIDFromPath(r.URL.Path)
+	docID := indexDocIDFromRequest(r)
 	if docID == "" {
 		writeError(w, http.StatusBadRequest, "invalid_route", "expected /index/:doc_id")
 		return
 	}
-	entityType := strings.TrimSpace(r.URL.Query().Get("entityType"))
+	queryEntityType := strings.TrimSpace(r.URL.Query().Get("entityType"))
+	entityType := queryEntityType
+	if entityType == "" {
+		entityType = indexer.EntityDocument
+	}
+	if queryEntityType != "" && !isValidEntityType(entityType) {
+		writeError(w, http.StatusBadRequest, "invalid_entity_type", "unsupported entity type")
+		return
+	}
 	if r.Method == http.MethodDelete {
-		if err := s.indexer.MarkDeleted(r.Context(), entityType, docID); err != nil {
+		var result indexer.WriteResult
+		if err := s.runMutation(r.Context(), func() error {
+			var err error
+			result, err = s.indexer.MarkDeleted(r.Context(), entityType, docID)
+			return err
+		}); err != nil {
+			if writeCacheMutationError(w, err) {
+				return
+			}
 			writeError(w, http.StatusBadGateway, "index_delete_failed", "index delete failed")
 			return
 		}
-		s.clearCachedSearch(r.Context())
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": docID, "status": "deleted"})
+		if !result.Applied {
+			writeError(w, http.StatusConflict, "stale_source_version", "document has a newer source version")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": docID, "status": "deleted", "applied": result.Applied})
 		return
 	}
 	if r.Method != http.MethodPut && r.Method != http.MethodPost {
@@ -436,20 +499,32 @@ func (s *HTTPServer) handleIndexDocument(w http.ResponseWriter, r *http.Request)
 	}
 
 	var body indexDocumentRequest
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	r.Body = http.MaxBytesReader(w, r.Body, 64<<10)
+	if err := decodeSingleJSON(r.Body, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_json", "invalid json")
 		return
 	}
 	doc := body.toSearchDocument(docID)
-	if entityType != "" {
-		doc.EntityType = entityType
+	if queryEntityType != "" {
+		doc.EntityType = queryEntityType
 	}
-	if err := s.indexer.Upsert(r.Context(), doc); err != nil {
+	if !isValidEntityType(doc.EntityType) {
+		writeError(w, http.StatusBadRequest, "invalid_entity_type", "unsupported entity type")
+		return
+	}
+	var result indexer.WriteResult
+	if err := s.runMutation(r.Context(), func() error { var err error; result, err = s.indexer.Upsert(r.Context(), doc); return err }); err != nil {
+		if writeCacheMutationError(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadGateway, "index_upsert_failed", "index upsert failed")
 		return
 	}
-	s.clearCachedSearch(r.Context())
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": docID, "entityType": doc.EntityType})
+	if !result.Applied {
+		writeError(w, http.StatusConflict, "stale_source_version", "document has a newer source version")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "id": docID, "entityType": doc.EntityType, "applied": result.Applied})
 }
 
 func (s *HTTPServer) handleFullRebuild(w http.ResponseWriter, r *http.Request) {
@@ -461,12 +536,15 @@ func (s *HTTPServer) handleFullRebuild(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed")
 		return
 	}
-	result, err := s.indexer.StartFullRebuild(r.Context())
+	var result indexer.RebuildResult
+	err := s.runMutation(r.Context(), func() error { var err error; result, err = s.indexer.StartFullRebuild(r.Context()); return err })
 	if err != nil {
+		if writeCacheMutationError(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadGateway, "rebuild_start_failed", "rebuild failed to start")
 		return
 	}
-	s.clearCachedSearch(r.Context())
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "jobId": result.JobID})
 }
 
@@ -480,12 +558,19 @@ func (s *HTTPServer) handleEntityRebuild(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "invalid_route", "expected /api/index/rebuild/:entityType/:entityId")
 		return
 	}
-	result, err := s.indexer.StartEntityRebuild(r.Context(), parts[0], parts[1])
+	var result indexer.RebuildResult
+	err := s.runMutation(r.Context(), func() error {
+		var err error
+		result, err = s.indexer.StartEntityRebuild(r.Context(), parts[0], parts[1])
+		return err
+	})
 	if err != nil {
+		if writeCacheMutationError(w, err) {
+			return
+		}
 		writeError(w, http.StatusBadRequest, "entity_rebuild_start_failed", err.Error())
 		return
 	}
-	s.clearCachedSearch(r.Context())
 	writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "jobId": result.JobID})
 }
 
@@ -634,21 +719,24 @@ func boundValue(value, fallback, min, max int) int {
 }
 
 func (s *HTTPServer) getCached(ctx context.Context, resource string, values url.Values) (json.RawMessage, bool) {
-	if s.cache.Cache == nil {
+	key, enabled := s.scopedCacheKey(ctx, resource, values)
+	if !enabled {
 		return nil, false
 	}
-	return s.cache.Cache.Get(ctx, s.cacheKey(resource, values))
+	return s.cache.Cache.Get(ctx, key)
 }
 
 func (s *HTTPServer) setCached(ctx context.Context, resource string, values url.Values, payload any, ttlSeconds int64) {
-	if s.cache.Cache == nil {
+	key, enabled := s.scopedCacheKey(ctx, resource, values)
+	if !enabled {
 		return
 	}
-	s.cache.Cache.Set(ctx, s.cacheKey(resource, values), payload, ttlSeconds)
+	s.cache.Cache.Set(ctx, key, payload, ttlSeconds)
 }
 
-func (s *HTTPServer) cacheState() string {
-	if s.cache.Cache == nil {
+func (s *HTTPServer) cacheState(ctx context.Context) string {
+	scope, ok := ctx.Value(cacheScopeKey{}).(cacheScope)
+	if !ok || !scope.enabled {
 		return "BYPASS"
 	}
 	return "MISS"
@@ -659,9 +747,94 @@ func (s *HTTPServer) clearCachedSearch(ctx context.Context) {
 		return
 	}
 	s.cacheVersion.Add(1)
+	if shared, ok := s.cache.Cache.(namespaceVersions); ok {
+		version, err := shared.BumpVersion(ctx, s.cache.Namespace)
+		if err == nil {
+			s.cacheVersion.Store(version)
+		}
+	}
 	s.cache.Cache.Clear(ctx, s.cache.Namespace+":query:*")
 	s.cache.Cache.Clear(ctx, s.cache.Namespace+":filter:*")
 	s.cache.Cache.Clear(ctx, s.cache.Namespace+":highlight:*")
+	s.cache.Cache.Clear(ctx, s.cache.Namespace+":tags:*")
+}
+
+type cacheMutationError struct {
+	phase string
+	err   error
+}
+
+func (e *cacheMutationError) Error() string {
+	return "cache mutation " + e.phase + ": " + e.err.Error()
+}
+func (e *cacheMutationError) Unwrap() error { return e.err }
+
+func writeCacheMutationError(w http.ResponseWriter, err error) bool {
+	var cacheErr *cacheMutationError
+	if !errors.As(err, &cacheErr) {
+		return false
+	}
+	message := "shared cache unavailable; mutation was not executed"
+	if cacheErr.phase == "completion" {
+		message = "mutation may have completed; shared cache completion failed"
+	}
+	writeError(w, http.StatusServiceUnavailable, "cache_mutation_"+cacheErr.phase+"_failed", message)
+	return true
+}
+
+// Independent started/completed counters keep every instance out of cache
+// during writes. Count completions (not sequence assignment), so concurrent
+// operations can finish in any order. Never retry an ambiguous bump: an
+// unbalanced fence safely remains BYPASS until an operator reconciles it.
+func (s *HTTPServer) runMutation(ctx context.Context, operation func() error) error {
+	if s.cache.Cache == nil {
+		return operation()
+	}
+	shared, hasShared := s.cache.Cache.(namespaceVersions)
+	if hasShared {
+		// GET initializes a missing Redis version to 1, while INCR starts at
+		// 1 itself. Initialize both keys before incrementing started so the
+		// first in-flight mutation cannot appear completed to a cold reader.
+		for _, suffix := range []string{":mutation:started", ":mutation:completed"} {
+			if _, err := shared.GetVersion(ctx, s.cache.Namespace+suffix); err != nil {
+				return &cacheMutationError{phase: "precommit", err: err}
+			}
+		}
+		if _, err := shared.BumpVersion(ctx, s.cache.Namespace+":mutation:started"); err != nil {
+			return &cacheMutationError{phase: "precommit", err: err}
+		}
+	} else {
+		s.mutationStarted.Add(1)
+	}
+	err := operation()
+	if hasShared {
+		completionCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.requestTimeout)
+		defer cancel()
+		if _, completionErr := shared.BumpVersion(completionCtx, s.cache.Namespace+":mutation:completed"); completionErr != nil {
+			return &cacheMutationError{phase: "completion", err: errors.Join(err, completionErr)}
+		}
+	} else {
+		s.mutationCompleted.Add(1)
+	}
+	return err
+}
+
+func (s *HTTPServer) stableMutationVersion(ctx context.Context) (int64, bool) {
+	if shared, ok := s.cache.Cache.(namespaceVersions); ok {
+		started, err := shared.GetVersion(ctx, s.cache.Namespace+":mutation:started")
+		if err != nil {
+			return 0, false
+		}
+		completed, err := shared.GetVersion(ctx, s.cache.Namespace+":mutation:completed")
+		if err != nil {
+			return 0, false
+		}
+		confirmed, err := shared.GetVersion(ctx, s.cache.Namespace+":mutation:started")
+		return started, err == nil && started == confirmed && started == completed
+	}
+	started := s.mutationStarted.Load()
+	completed := s.mutationCompleted.Load()
+	return started, started == completed && started == s.mutationStarted.Load()
 }
 
 func (s *HTTPServer) cacheTTL(resource string) int64 {
@@ -675,11 +848,90 @@ func (s *HTTPServer) cacheTTL(resource string) int64 {
 	}
 }
 
-func (s *HTTPServer) cacheKey(resource string, values url.Values) string {
+func (s *HTTPServer) cacheKeyAt(resource string, values url.Values, version int64, configHash string) string {
 	normalized := cloneQuery(values).Encode()
-	version := s.cacheVersion.Load()
-	sum := sha256.Sum256([]byte(resource + "?v=" + strconv.FormatInt(version, 10) + "&" + normalized))
+	sum := sha256.Sum256([]byte(resource + "?v=" + strconv.FormatInt(version, 10) + "&config=" + configHash + "&" + normalized))
 	return fmt.Sprintf("%s:%s:%x", s.cache.Namespace, resource, sum[:16])
+}
+
+type cacheScopeKey struct{}
+type cacheScope struct {
+	version         int64
+	snapshot        indexer.RuntimeSnapshot
+	enabled         bool
+	mutationVersion int64
+}
+
+// Capture once before the miss and keep this identity through every write.
+// A failed shared-version read bypasses both cache tiers, including warm L1.
+func (s *HTTPServer) withCacheScope(ctx context.Context) context.Context {
+	scope := cacheScope{version: s.cacheVersion.Load(), enabled: s.cache.Cache != nil}
+	if s.indexer != nil {
+		scope.snapshot = s.indexer.RuntimeSnapshot()
+	}
+	if scope.enabled {
+		scope.mutationVersion, scope.enabled = s.stableMutationVersion(ctx)
+	}
+	if shared, ok := s.cache.Cache.(namespaceVersions); ok {
+		version, err := shared.GetVersion(ctx, s.cache.Namespace)
+		scope.version = version
+		scope.enabled = scope.enabled && err == nil
+		if err == nil {
+			s.cacheVersion.Store(scope.version)
+		}
+	}
+	return context.WithValue(ctx, cacheScopeKey{}, scope)
+}
+
+func (s *HTTPServer) scopedCacheKey(ctx context.Context, resource string, values url.Values) (string, bool) {
+	scope, ok := ctx.Value(cacheScopeKey{}).(cacheScope)
+	if !ok {
+		return "", false
+	}
+	return s.cacheKeyAt(resource, values, scope.version, scope.snapshot.Hash+"&mutation="+strconv.FormatInt(scope.mutationVersion, 10)), scope.enabled
+}
+
+func (s *HTTPServer) cacheHighlights(ctx context.Context, req searchRequest, items []indexer.SearchResult) {
+	entries := make([]CacheEntry, 0, len(items))
+	for _, item := range items {
+		key, enabled := s.scopedCacheKey(ctx, "highlight", req.highlightCacheValues(item.ID))
+		if !enabled {
+			return
+		}
+		entries = append(entries, CacheEntry{Key: key, Value: item.Highlight, TTLSeconds: s.cache.HighlightTTLSeconds})
+	}
+	if batch, ok := s.cache.Cache.(interface {
+		SetBatch(context.Context, []CacheEntry)
+	}); ok {
+		batch.SetBatch(ctx, entries)
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, highlightCacheBudget)
+	defer cancel()
+	for _, entry := range entries {
+		if ctx.Err() != nil {
+			return
+		}
+		s.cache.Cache.Set(ctx, entry.Key, entry.Value, entry.TTLSeconds)
+	}
+}
+
+func cacheHitPayload(raw json.RawMessage) json.RawMessage {
+	var body map[string]json.RawMessage
+	if json.Unmarshal(raw, &body) != nil {
+		return raw
+	}
+	var debug map[string]json.RawMessage
+	if json.Unmarshal(body["debug"], &debug) != nil || debug == nil {
+		return raw
+	}
+	debug["cache_hit"] = json.RawMessage("true")
+	body["debug"], _ = json.Marshal(debug)
+	updated, err := json.Marshal(body)
+	if err != nil {
+		return raw
+	}
+	return updated
 }
 
 func cloneQuery(values url.Values) url.Values {
@@ -711,25 +963,66 @@ func cleanList(values []string) []string {
 	return cleaned
 }
 
-func indexDocIDFromPath(path string) string {
+func indexDocIDFromRequest(r *http.Request) string {
+	return indexDocIDFromEscapedPath(r.URL.EscapedPath())
+}
+
+func indexDocIDFromEscapedPath(path string) string {
 	for _, prefix := range []string{"/api/index/", "/index/"} {
 		if strings.HasPrefix(path, prefix) {
-			rest := strings.Trim(strings.TrimPrefix(path, prefix), "/")
-			if rest == "" || strings.Contains(rest, "/") || rest == "rebuild" || strings.HasPrefix(rest, "rebuild/") {
+			rest := strings.TrimPrefix(path, prefix)
+			if rest == "" || strings.Contains(rest, "/") {
 				return ""
 			}
-			if value, err := url.PathUnescape(rest); err == nil {
-				return strings.TrimSpace(value)
+			value, err := url.PathUnescape(rest)
+			if err != nil || strings.Contains(value, "/") {
+				return ""
 			}
-			return rest
+			value = strings.TrimSpace(value)
+			if value == "" || value == "rebuild" || strings.HasPrefix(value, "rebuild/") {
+				return ""
+			}
+			return value
 		}
 	}
 	return ""
 }
 
+func isValidEntityType(entityType string) bool {
+	for _, allowed := range indexer.EntityTypes {
+		if entityType == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func decodeSingleJSON(reader io.Reader, destination any) error {
+	decoder := json.NewDecoder(reader)
+	decoder.UseNumber()
+	var raw json.RawMessage
+	if err := decoder.Decode(&raw); err != nil {
+		return err
+	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return errors.New("json value must not be null")
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("multiple json values")
+		}
+		return err
+	}
+	valueDecoder := json.NewDecoder(bytes.NewReader(trimmed))
+	valueDecoder.UseNumber()
+	return valueDecoder.Decode(destination)
+}
+
 func (r indexDocumentRequest) toSearchDocument(docID string) indexer.SearchDocument {
 	now := time.Now().UTC()
-	createdAt := now
+	createdAt := time.Time{}
 	updatedAt := now
 	if r.CreatedAt != nil {
 		createdAt = *r.CreatedAt
@@ -785,34 +1078,43 @@ func writeRawJSON(w http.ResponseWriter, status int, payload json.RawMessage) {
 func setTimingHeaders(w http.ResponseWriter, payload map[string]any) {
 	timing, ok := payload["timing"].(indexer.SearchTiming)
 	if !ok {
+		if debug, exists := payload["debug"].(map[string]any); exists {
+			timing, ok = debug["timing"].(indexer.SearchTiming)
+		}
+	}
+	if !ok {
 		return
 	}
+	writeTimingHeaders(w, timing)
+}
+
+func writeTimingHeaders(w http.ResponseWriter, timing indexer.SearchTiming) {
 	w.Header().Set("X-NexusIndex-PG-Ms", strconv.FormatInt(timing.PGMS, 10))
 	w.Header().Set("X-NexusIndex-Scoring-Ms", strconv.FormatInt(timing.ScoringMS, 10))
 	w.Header().Set("X-NexusIndex-Highlight-Ms", strconv.FormatInt(timing.HighlightMS, 10))
 	w.Header().Set("X-NexusIndex-Candidate-Size", strconv.Itoa(timing.CandidateSize))
-	w.Header().Set("X-NexusIndex-Index-Lag-Ms", strconv.FormatInt(timing.IndexLagMS, 10))
+	if timing.IndexLagMS != nil {
+		w.Header().Set("X-NexusIndex-Index-Lag-Ms", strconv.FormatInt(*timing.IndexLagMS, 10))
+	}
 }
 
 func setTimingHeadersFromRaw(w http.ResponseWriter, payload json.RawMessage) {
 	var body struct {
-		Timing indexer.SearchTiming `json:"timing"`
+		Timing *indexer.SearchTiming `json:"timing"`
 		Debug  struct {
-			Timing indexer.SearchTiming `json:"timing"`
+			Timing *indexer.SearchTiming `json:"timing"`
 		} `json:"debug"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return
 	}
 	timing := body.Timing
-	if timing.PGMS == 0 && timing.ScoringMS == 0 && timing.HighlightMS == 0 && body.Debug.Timing.CandidateSize > 0 {
+	if timing == nil {
 		timing = body.Debug.Timing
 	}
-	w.Header().Set("X-NexusIndex-PG-Ms", strconv.FormatInt(timing.PGMS, 10))
-	w.Header().Set("X-NexusIndex-Scoring-Ms", strconv.FormatInt(timing.ScoringMS, 10))
-	w.Header().Set("X-NexusIndex-Highlight-Ms", strconv.FormatInt(timing.HighlightMS, 10))
-	w.Header().Set("X-NexusIndex-Candidate-Size", strconv.Itoa(timing.CandidateSize))
-	w.Header().Set("X-NexusIndex-Index-Lag-Ms", strconv.FormatInt(timing.IndexLagMS, 10))
+	if timing != nil {
+		writeTimingHeaders(w, *timing)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, code, message string) {

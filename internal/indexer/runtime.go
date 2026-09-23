@@ -2,10 +2,13 @@ package indexer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 )
 
@@ -295,38 +298,62 @@ func defaultSynonyms() map[string][]string {
 }
 
 type runtimeConfigStore struct {
-	value   atomic.Value
-	version atomic.Uint64
+	mu    sync.Mutex
+	value atomic.Value
+}
+
+type RuntimeSnapshot struct {
+	Config  RuntimeConfig
+	Version uint64
+	Hash    string
+}
+
+func runtimeSnapshot(cfg RuntimeConfig, version uint64) RuntimeSnapshot {
+	cfg = cfg.Normalized()
+	raw, _ := json.Marshal(cfg)
+	hash := sha256.Sum256(raw)
+	return RuntimeSnapshot{Config: cfg, Version: version, Hash: hex.EncodeToString(hash[:])}
 }
 
 func newRuntimeConfigStore(cfg RuntimeConfig) *runtimeConfigStore {
 	store := &runtimeConfigStore{}
-	store.value.Store(cfg.Normalized())
-	store.version.Store(1)
+	store.value.Store(runtimeSnapshot(cfg, 1))
 	return store
 }
 
 func (s *runtimeConfigStore) Get() RuntimeConfig {
+	return s.Snapshot().Config
+}
+
+func (s *runtimeConfigStore) Snapshot() RuntimeSnapshot {
 	if s == nil {
-		return DefaultRuntimeConfig()
+		return runtimeSnapshot(DefaultRuntimeConfig(), 1)
 	}
-	cfg, ok := s.value.Load().(RuntimeConfig)
+	snapshot, ok := s.value.Load().(RuntimeSnapshot)
 	if !ok {
-		return DefaultRuntimeConfig()
+		return runtimeSnapshot(DefaultRuntimeConfig(), 1)
 	}
-	return cfg.DeepCopy()
+	snapshot.Config = snapshot.Config.DeepCopy()
+	return snapshot
 }
 
 func (s *runtimeConfigStore) Update(_ context.Context, cfg RuntimeConfig) RuntimeConfig {
-	cfg = cfg.Normalized().DeepCopy()
-	s.value.Store(cfg)
-	s.version.Add(1)
-	return cfg.DeepCopy()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	snapshot := runtimeSnapshot(cfg, s.Snapshot().Version+1)
+	s.value.Store(snapshot)
+	return snapshot.Config.DeepCopy()
+}
+
+func (s *runtimeConfigStore) Patch(_ context.Context, override RuntimeConfig) RuntimeConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.Snapshot()
+	next := runtimeSnapshot(current.Config.Merge(override), current.Version+1)
+	s.value.Store(next)
+	return next.Config.DeepCopy()
 }
 
 func (s *runtimeConfigStore) Version() uint64 {
-	if s == nil {
-		return 1
-	}
-	return s.version.Load()
+	return s.Snapshot().Version
 }

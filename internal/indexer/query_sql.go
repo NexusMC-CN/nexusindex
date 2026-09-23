@@ -2,6 +2,7 @@ package indexer
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -10,7 +11,7 @@ type searchSQLPlan struct {
 	orderBy   string
 }
 
-func buildSearchSQLPlan(sort SearchSort, hasTextQuery bool, cfg ScoringConfig, scoringNowExpr string, arg func(any) string) searchSQLPlan {
+func buildSearchSQLPlan(sort SearchSort, hasTextQuery bool, cfg ScoringConfig, scoringNowExpr string, arg func(any) string, queries ...StructuredQuery) searchSQLPlan {
 	plan := searchSQLPlan{}
 	switch sort {
 	case SortLatest:
@@ -23,7 +24,7 @@ func buildSearchSQLPlan(sort SearchSort, hasTextQuery bool, cfg ScoringConfig, s
 		scoringNowExpr, arg(cfg.TimeDecayFactor),
 	)
 	popularity := fmt.Sprintf(
-		"(ln(1 + greatest(s.view_count, 0)) * %s + ln(1 + greatest(s.download_count, 0)) * %s + ln(1 + greatest(s.like_count, 0)) * %s + ln(1 + greatest(s.weight, 0)) * 0.05)",
+		"(ln(1 + greatest(s.view_count::double precision, 0)) * %s + ln(1 + greatest(s.download_count::double precision, 0)) * %s + ln(1 + greatest(s.like_count::double precision, 0)) * %s + ln(1 + greatest(s.weight::double precision, 0)) * 0.05)",
 		arg(cfg.ViewCountWeight), arg(cfg.DownloadCountWeight), arg(cfg.LikeCountWeight),
 	)
 	if sort == SortPopular {
@@ -43,9 +44,32 @@ func buildSearchSQLPlan(sort SearchSort, hasTextQuery bool, cfg ScoringConfig, s
 			arg(cfg.TagsWeight/totalTextWeight), arg(cfg.TitleWeight/totalTextWeight),
 		)
 	}
+	if len(queries) > 0 {
+		if boost := queryBoostSQL(queries[0], arg); boost != "" {
+			textRank = "(" + textRank + " + " + boost + ")"
+		}
+	}
 	plan.scoreExpr = fmt.Sprintf("(%s * %s + %s * %s + %s * %s)", textRank, arg(cfg.TextScoreWeight), popularity, arg(cfg.PopularityScoreWeight), freshness, arg(cfg.FreshnessScoreWeight))
 	plan.orderBy = "sort_score DESC, sort_time DESC, entity_type ASC, entity_id ASC"
 	return plan
+}
+
+func queryBoostSQL(query StructuredQuery, arg func(any) string) string {
+	keys := make([]string, 0, len(query.Boosts))
+	for key := range query.Boosts {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := []string{}
+	searchable := "lower(s.title || ' ' || array_to_string(s.tags, ' ') || ' ' || array_to_string(s.keywords, ' ') || ' ' || coalesce(s.payload::text, ''))"
+	for _, key := range keys {
+		kind, term, ok := strings.Cut(key, ":")
+		if !ok || (kind != "version" && kind != "loader") || term == "" {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("CASE WHEN strpos(%s, %s) > 0 THEN %s::double precision ELSE 0 END", searchable, arg(term), arg(query.Boosts[key])))
+	}
+	return strings.Join(parts, " + ")
 }
 
 func keysetPredicate(sort SearchSort, cursor *searchCursor, args *[]any) string {

@@ -15,7 +15,8 @@
     "dist"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.json"
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test cache-stats.test.mjs"
   },
   "devDependencies": {
     "@types/node": "^20.19.37",

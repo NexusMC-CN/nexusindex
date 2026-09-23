@@ -59,8 +59,12 @@ func requireActiveGeneration(generation *Generation) (int64, error) {
 }
 
 func (s *GenerationStore) Active(ctx context.Context) (*Generation, error) {
+	return loadActiveGeneration(ctx, s.db)
+}
+
+func loadActiveGeneration(ctx context.Context, db Querier) (*Generation, error) {
 	generation := &Generation{}
-	err := s.db.QueryRow(ctx, `SELECT id, status, created_at, activated_at, retired_at, build_job_id, document_count, source_high_watermark, coalesce(failure, '') FROM index_generations WHERE status = 'active'`).Scan(&generation.ID, &generation.Status, &generation.CreatedAt, &generation.ActivatedAt, &generation.RetiredAt, &generation.BuildJobID, &generation.DocumentCount, &generation.SourceHighWatermark, &generation.Failure)
+	err := db.QueryRow(ctx, `SELECT id, status, created_at, activated_at, retired_at, build_job_id, document_count, source_high_watermark, coalesce(failure, '') FROM index_generations WHERE status = 'active'`).Scan(&generation.ID, &generation.Status, &generation.CreatedAt, &generation.ActivatedAt, &generation.RetiredAt, &generation.BuildJobID, &generation.DocumentCount, &generation.SourceHighWatermark, &generation.Failure)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrIndexUnavailable
 	}
@@ -71,12 +75,63 @@ func (s *GenerationStore) Active(ctx context.Context) (*Generation, error) {
 }
 
 func (s *GenerationStore) CreateBuilding(ctx context.Context, jobID, watermark int64) (*Generation, error) {
+	if err := s.RecoverStaleBuilding(ctx); err != nil {
+		return nil, err
+	}
 	generation := &Generation{}
 	err := s.db.QueryRow(ctx, `INSERT INTO index_generations (status, build_job_id, source_high_watermark) VALUES ('building', nullif($1, 0), $2) RETURNING id, status, created_at, build_job_id, document_count, source_high_watermark`, jobID, watermark).Scan(&generation.ID, &generation.Status, &generation.CreatedAt, &generation.BuildJobID, &generation.DocumentCount, &generation.SourceHighWatermark)
 	if err != nil && strings.Contains(err.Error(), "index_generations_single_building_idx") {
 		return nil, ErrRebuildInProgress
 	}
 	return generation, err
+}
+
+// Running rebuilds hold a session lease on -jobID for their entire lifetime.
+// A status row alone cannot distinguish a crashed process from a live job.
+func (s *GenerationStore) RecoverStaleBuilding(ctx context.Context) error {
+	tx, err := s.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(context.Background())
+	rows, err := tx.Query(ctx, `SELECT g.id,coalesce(g.build_job_id,0) FROM index_generations g WHERE g.status='building' FOR UPDATE`)
+	if err != nil {
+		return err
+	}
+	type orphan struct{ id, job int64 }
+	candidates := []orphan{}
+	for rows.Next() {
+		var item orphan
+		if err := rows.Scan(&item.id, &item.job); err != nil {
+			rows.Close()
+			return err
+		}
+		candidates = append(candidates, item)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, item := range candidates {
+		available := true
+		if item.job > 0 {
+			if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, -item.job).Scan(&available); err != nil {
+				return err
+			}
+		}
+		if !available {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE index_generations SET status='failed',failure='recovered abandoned rebuild' WHERE id=$1`, item.id); err != nil {
+			return err
+		}
+		if item.job > 0 {
+			if _, err := tx.Exec(ctx, `UPDATE index_sync_log SET status='failed',finished_at=now(),error='recovered abandoned rebuild' WHERE id=$1 AND status='running'`, item.job); err != nil {
+				return err
+			}
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 func (s *GenerationStore) SetDocumentCount(ctx context.Context, id, count int64) error {
@@ -90,6 +145,16 @@ func (s *GenerationStore) Activate(ctx context.Context, id int64) error {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, generationSwitchLockKey); err != nil {
+		return err
+	}
+	if err := s.activateInTransaction(ctx, tx, id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (s *GenerationStore) activateInTransaction(ctx context.Context, tx pgx.Tx, id int64) error {
 	var status GenerationStatus
 	if err := tx.QueryRow(ctx, `SELECT status FROM index_generations WHERE id = $1 FOR UPDATE`, id).Scan(&status); err != nil {
 		return err
@@ -103,7 +168,7 @@ func (s *GenerationStore) Activate(ctx context.Context, id int64) error {
 	if _, err := tx.Exec(ctx, `UPDATE index_generations SET status = 'active', activated_at = now(), retired_at = NULL WHERE id = $1`, id); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func (s *GenerationStore) Fail(ctx context.Context, id int64, cause error) error {
